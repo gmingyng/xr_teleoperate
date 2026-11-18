@@ -1,17 +1,10 @@
 """Robot-side OpenPI client: observe -> infer -> execute -> measured feedback."""
 
-import argparse
-from contextlib import nullcontext
 import logging
-from pathlib import Path
 import threading
 import time
-import numpy as np
 
-from .robot_ctrl.controller import EEFController, parse_policy_chunk
-from .utils.cameras import CameraCapture, MockCameras
-from .utils.config import load_config
-from .utils.ownership import ControllerLease
+from .robot_ctrl.controller import parse_policy_chunk
 from .utils.websocket import PolicyClient
 
 log = logging.getLogger(__name__)
@@ -47,18 +40,27 @@ def observation(controller, cameras, config, sequence, prompt):
     return result, earliest
 
 
-def hanging_step(controller, expires):
-    from .robot_ctrl.postures import HANGING
-    state, _ = controller.snapshot()
-    motion = controller.config["motion"]
-    delta = HANGING - state["q14"]
-    distance = float(np.max(np.abs(delta)))
-    step = min(motion["max_joint_step_rad"], motion["max_speed_rad_s"] / motion["command_hz"])
-    target = HANGING if distance <= step else state["q14"] + delta * (step / distance)
-    return controller.apply(None, expires, joint_positions=target)
+def execute_policy(controller, response, sequence, expires, stop):
+    config = controller.config
+    settings = config["policy"]
+    eef, joints = parse_policy_chunk(response, settings)
+    if eef is not None:
+        controller.validate_deltas(eef)
+    length = len(eef if eef is not None else joints)
+    count = min(length, settings["execute_steps"])
+    for index in range(count):
+        if stop.is_set():
+            break
+        status = controller.apply(None if eef is None else eef[index], min(expires,
+            time.monotonic() + config["motion"]["action_timeout_s"]),
+            joint_positions=None if joints is None else joints[index])
+        controller.last_action = dict(status, observation_id=sequence, step=index,
+                                      discarded_steps=length-count)
+        if index + 1 < count:
+            stop.wait(1.0 / config["motion"]["command_hz"])
 
 
-def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, hanging_test=False):
+def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, handle_response=execute_policy):
     stop = threading.Event() if stop is None else stop
     client = PolicyClient(config["policy"])
     sequence, completed = 0, 0
@@ -80,31 +82,7 @@ def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, hangi
                 expires = observed + settings["max_observation_age_s"]
                 if time.monotonic() >= expires:
                     raise TimeoutError("policy response is older than max_observation_age_s")
-                if hanging_test:
-                    if "actions" not in response:
-                        raise ValueError("policy response is missing actions")
-                    print(f"Cloud actions [{sequence}]: {response['actions']}", flush=True)
-                    status = hanging_step(controller, min(expires,
-                        time.monotonic() + config["motion"]["action_timeout_s"]))
-                    controller.last_action = dict(status, observation_id=sequence, target="local_hanging")
-                    completed += 1
-                    stop.wait(max(0, 1 / config["motion"]["command_hz"] - (time.monotonic()-started)))
-                    continue
-                eef, joints = parse_policy_chunk(response, settings)
-                if eef is not None:
-                    controller.validate_deltas(eef)
-                length = len(eef if eef is not None else joints)
-                count = min(length, settings["execute_steps"])
-                for index in range(count):
-                    if stop.is_set():
-                        break
-                    status = controller.apply(None if eef is None else eef[index], min(expires,
-                        time.monotonic() + config["motion"]["action_timeout_s"]),
-                        joint_positions=None if joints is None else joints[index])
-                    controller.last_action = dict(status, observation_id=sequence, step=index,
-                                                  discarded_steps=length-count)
-                    if index + 1 < count:
-                        stop.wait(1.0 / config["motion"]["command_hz"])
+                handle_response(controller, response, sequence, expires, stop)
                 completed += 1
                 log.info("Observation %d: %s", sequence, controller.last_action["status"])
             except Exception as exc:
@@ -131,41 +109,3 @@ def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, hangi
                 finally:
                     controller.close()
     return completed
-
-
-def main(argv=None, *, hanging_test=False):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(Path(__file__).parent / "config/g1d.json"))
-    parser.add_argument("--url", help="OpenPI policy ws://HOST:PORT URL")
-    parser.add_argument("--prompt", default="")
-    parser.add_argument("--execute", action="store_true", help="acquire and execute on the real robot")
-    parser.add_argument("--mock", action="store_true", help="synthetic robot/cameras; never connects to DDS")
-    parser.add_argument("--max-steps", type=int, default=0, help="stop after N inferences; 0 means continuous")
-    args = parser.parse_args(argv)
-    if args.max_steps < 0:
-        parser.error("--max-steps cannot be negative")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    config = load_config(args.config)
-    if args.url:
-        if not args.url.startswith(("ws://", "wss://")):
-            parser.error("--url must start with ws:// or wss://")
-        config["policy"]["url"] = args.url
-    if args.mock:
-        from .robot_ctrl.mock import MockBackend, MockKinematics
-        backend, kin = MockBackend(config), MockKinematics()
-        cameras = MockCameras(config["cameras"])
-    else:
-        from .robot_ctrl.dds import G1DDSBackend
-        from .robot_ctrl.kinematics import G1DKinematics
-        backend, kin = G1DDSBackend(config), G1DKinematics(config)
-        cameras = CameraCapture(config["cameras"])
-    controller = EEFController(config, backend, kin, execute=args.execute or args.mock,
-                               control_waist=not hanging_test)
-    lease = ControllerLease(config["device"]["controller_lock"]) if args.execute and not args.mock else nullcontext()
-    try:
-        with lease:
-            run(config, controller, cameras, prompt=args.prompt, max_steps=args.max_steps,
-                hanging_test=hanging_test)
-    except KeyboardInterrupt:
-        log.info("Stopped")
-    return 0

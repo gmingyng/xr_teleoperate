@@ -9,7 +9,8 @@ import numpy as np
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from unitree_openpi.robot_ctrl.joint_motion import check_target, motion_parser, motion_session
+from unitree_openpi.robot_ctrl.joint_motion import check_target
+from unitree_openpi.scripts._motion import motion_parser, motion_session
 from unitree_openpi.robot_ctrl.kinematics import ARM_JOINT_NAMES
 
 
