@@ -7,3 +7,6 @@
 [submodule "teleop/teleimager"]
 	path = teleop/teleimager
 	url = https://github.com/unitreerobotics/teleimager.git
+[submodule "unitree_robotskills"]
+	path = unitree_robotskills
+	url = https://github.com/unitreerobotics/unitree_robotskills.git
