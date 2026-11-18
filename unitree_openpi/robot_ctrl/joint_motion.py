@@ -109,7 +109,10 @@ def swing_blend(elapsed):
 
 def run_swing(backend, kin, config, limits):
     hanging = check_target(HANGING, limits)
-    reset = check_target(np.zeros(14), limits)
+    raised = np.zeros(14)
+    for side in ("left", "right"):
+        raised[ARM_JOINT_NAMES.index(f"{side}_shoulder_pitch_joint")] = math.radians(-30)
+    raised = check_target(raised, limits)
     motion = config["motion"]
     policy = config["policy"]
     default_internal = config["device"]["gripper_interface"] == "internal"
@@ -130,7 +133,7 @@ def run_swing(backend, kin, config, limits):
     arm_speed = motion["max_speed_rad_s"]
     grip_speed = motion["gripper_speed"]
     effective_time = MOVE_SECONDS - RAMP_SECONDS
-    if (np.max(abs(reset - hanging)) / effective_time > arm_speed or
+    if (np.max(abs(raised - hanging)) / effective_time > arm_speed or
             np.max(abs(opened - closed)) / effective_time > grip_speed):
         raise ValueError("10-second cycle exceeds configured joint or gripper speed")
     state = backend.read()
@@ -157,7 +160,7 @@ def run_swing(backend, kin, config, limits):
                 raise TimeoutError("arms or grippers did not reach the swing starting pose")
         else:
             blend = swing_blend(now - cycle_start)
-            arm = hanging + blend * (reset-hanging)
+            arm = hanging + blend * (raised-hanging)
             grip = closed + blend * (opened-closed)
         backend.command(arm, kin.gravity(state["q14"]), grip)
         time.sleep(max(0.0, 1 / motion["command_hz"] - (time.monotonic()-now)))
