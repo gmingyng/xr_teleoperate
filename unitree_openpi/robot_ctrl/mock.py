@@ -49,7 +49,7 @@ class MockBackend:
                     waist_dq3=np.zeros(3), grip_q2=self.grip.copy(), grip_dq2=np.zeros(2),
                     received_monotonic_s=time.monotonic(), received_at=time.time())
 
-    def acquire(self, grip_q2, waist_q3, tau14):
+    def acquire(self, grip_q2, waist_q3, tau14, *, control_waist=True):
         self.acquired = True
 
     def command(self, q14, tau14, grip_q2=None):

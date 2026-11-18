@@ -265,7 +265,7 @@ class G1DDSBackend:
                     self._fault_locked(exc)
                 raise
 
-    def acquire(self, grip_q2, waist_q3, tau14, *, arm_zero_torque=False):
+    def acquire(self, grip_q2, waist_q3, tau14, *, arm_zero_torque=False, control_waist=True):
         """Acquire current arm posture after checking fixed grip and waist goals."""
         grip = _vector(grip_q2, 2, "gripper target")
         waist = waist_vector(waist_q3, "waist target").copy()
@@ -282,9 +282,9 @@ class G1DDSBackend:
                 state = self.read()
                 if np.max(np.abs(state["grip_q2"] - grip)) > self.motion["grip_tolerance"]:
                     raise ValueError("measured grippers differ from acquisition targets")
-                if np.max(np.abs(state["waist_q3"] - waist)) > self.motion["waist_tolerance_rad"]:
+                if control_waist and np.max(np.abs(state["waist_q3"] - waist)) > self.motion["waist_tolerance_rad"]:
                     raise ValueError("measured waist differs from acquisition target")
-                self._grip_target, self._waist_target = grip, waist
+                self._grip_target, self._waist_target = grip, waist if control_waist else None
                 self._initial_q, self._initial_tau = state["q14"].copy(), tau.copy()
                 acquisition_q = state["q14"].copy()
                 self._target_q, self._target_tau = self._initial_q.copy(), tau.copy()
@@ -295,7 +295,8 @@ class G1DDSBackend:
                     motor.mode = 0
                     motor.q = motor.dq = motor.tau = motor.kp = motor.kd = 0.0
                 self._enable_slots(ARM_SLOTS, "arm", self._initial_q)
-                self._enable_slots(WAIST_SLOTS, "waist", waist)
+                if control_waist:
+                    self._enable_slots(WAIST_SLOTS, "waist", waist)
                 if self._internal:
                     self._enable_slots(GRIP_SLOTS, "gripper", grip)
                 self._crc = self._sdk.CRC()
@@ -317,8 +318,8 @@ class G1DDSBackend:
                 state = self.read()
                 if (
                     np.max(np.abs(state["grip_q2"] - grip)) > self.motion["grip_tolerance"]
-                    or np.max(np.abs(state["waist_q3"] - waist))
-                    > self.motion["waist_tolerance_rad"]
+                    or (control_waist and np.max(np.abs(state["waist_q3"] - waist))
+                        > self.motion["waist_tolerance_rad"])
                     or self._samples["arm"]["mode_machine"] != self._mode_machine
                 ):
                     raise RuntimeError("gripper, waist or control mode changed during acquisition")
@@ -392,11 +393,12 @@ class G1DDSBackend:
 
     def _check_tracking_locked(self, state, now):
         checks = {
-            "waist": (state["waist_q3"], self._waist_target, self.motion["waist_tolerance_rad"]),
             "gripper": (state["grip_q2"], self._last_sent_grip, self.motion["grip_tolerance"]),
         }
         if self._last_sent_q is not None and not self._arm_zero_torque:
             checks["arm"] = (state["q14"], self._last_sent_q, self.motion["tracking_tolerance_rad"])
+        if self._waist_target is not None:
+            checks["waist"] = (state["waist_q3"], self._waist_target, self.motion["waist_tolerance_rad"])
         for name, (actual, target, tolerance) in checks.items():
             error = float(np.max(np.abs(actual - target)))
             if error > float(tolerance):
@@ -497,8 +499,8 @@ class G1DDSBackend:
                 holding = bool(
                     np.max(np.abs(state["q14"] - self._last_sent_q))
                     <= self.motion["tracking_tolerance_rad"]
-                    and np.max(np.abs(state["waist_q3"] - self._waist_target))
-                    <= self.motion["waist_tolerance_rad"]
+                    and (self._waist_target is None or np.max(np.abs(state["waist_q3"] - self._waist_target))
+                         <= self.motion["waist_tolerance_rad"])
                     and np.max(np.abs(state["grip_q2"] - self._grip_target))
                     <= self.motion["grip_tolerance"]
                 )

@@ -137,13 +137,14 @@ python unitree_openpi/scripts/swing_dual_arms.py --mock
 
 # 真机；eth0 替换为机器人通信网卡
 python unitree_openpi/scripts/reset_dual_arms.py --execute --interface eth0 --duration 5
-python unitree_openpi/scripts/swing_dual_arms.py --execute --interface eth0 --amplitude-deg 3 --period 6 --cycles 3
+python unitree_openpi/scripts/swing_dual_arms.py --execute
 ```
 
 复位沿用 teleop 的零关节角定义（14 维全零，不是末端坐标归零），从实测关节角做平滑插值，
-根据配置速度上限自动延长时间。摆动围绕启动姿态，仅改变左右肩俯仰关节，默认 ±3°、周期 6 秒、3 个周期，
-采用 sin³ 波形使开始和结束速度为零，结束回到启动姿态；幅度最大 10°。
-两者保持其余手臂关节、腰部和夹爪目标，使用现有 G1DDSBackend 的 250 Hz LowCmd、
+根据配置速度上限自动延长时间。swing 先平滑进入实测自然下垂位并闭爪，然后无限循环。
+前 4 秒平滑到双臂全零位并开爪，保持 1 秒，再用 4 秒返回下垂位并闭爪，保持 1 秒。保持阶段持续发布端点目标，Ctrl+C 停止发布。
+内置 Dex1 默认闭合 0、张开 2.3 rad，可通过 policy.closed_q2 和 policy.open_q2 覆盖。
+swing 只启用双臂和夹爪。两个脚本均使用 G1DDSBackend 的 250 Hz LowCmd、
 CRC、状态超时、跟踪检查和限速，以及 Pinocchio 重力前馈。无需相机、WebSocket 或 IK/CasADi。
 真机需要 Pinocchio 和 Unitree SDK；模拟模式使用假模型。
 
