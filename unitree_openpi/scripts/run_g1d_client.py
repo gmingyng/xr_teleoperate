@@ -1,4 +1,4 @@
-"""Collect G1-D observations and execute relative EEF policy actions."""
+"""Send G1-D observations and execute cloud policy actions."""
 
 from pathlib import Path
 import sys

@@ -82,7 +82,7 @@ def main():
     parser.add_argument("--interface")
     parser.add_argument("--keyboard", help="local Linux keyboard event device for exact held-key state")
     parser.add_argument("--speed", type=float, default=0.03, help="forward and lift speed in m/s")
-    parser.add_argument("--yaw-speed", type=float, default=0.03, help="turn speed in rad/s")
+    parser.add_argument("--yaw-speed", type=float, default=0.05, help="turn speed in rad/s")
     args = parser.parse_args()
     if not (0 < args.speed <= 0.0765 and 0 < args.yaw_speed <= 0.6):
         parser.error("speed must be in (0, 0.0765] and yaw-speed in (0, 0.6]")

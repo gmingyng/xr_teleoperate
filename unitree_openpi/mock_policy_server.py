@@ -17,7 +17,7 @@ def make_handler(protocol="openpi", delta_x=0.0):
                                 "simulation": True}))
         for payload in connection:
             obs = decode(payload)
-            state = np.asarray(obs["state"])
+            state = np.asarray(obs["observation/state"] if "observation/state" in obs else obs["state"])
             if state.shape not in ((12,), (14,)):
                 raise ValueError("mock server expects state shape (12,) or (14,)")
             action = np.zeros((1, len(state)), dtype=np.float32)

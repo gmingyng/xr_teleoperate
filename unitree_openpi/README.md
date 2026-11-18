@@ -1,168 +1,59 @@
 # G1-D / OpenPI
 
-独立的机器人侧客户端：采集双臂**实际关节反馈经 FK 得到的绝对末端位姿**及头部、左腕、右腕三张图像，通过 WebSocket 请求策略，再将相对 EEF 动作经 IK 转为 G1D DDS 控制目标。运行时不导入 `unitree_robotskills`，无需 XR 设备、Vuer 或 Meshcat。
+机器人客户端通过 DDS 读取双臂反馈，通过 ZMQ 接收相机画面，再通过 WebSocket 向云端策略请求动作。设备与协议配置见 [g1d.json](config/g1d.json)，代码来源见 [第三方声明](THIRD_PARTY_NOTICES.md)。
 
-业务代码和 G1D URDF 已放在本目录内，不导入原项目的 `teleop`、`teleimager` 或 robotskills。整体复制 `unitree_openpi/` 后仍可通过具名脚本启动；NumPy、SciPy、Pinocchio、OpenCV、PyZMQ、websockets、msgpack 和 Unitree SDK 仍需按 `requirements.txt` 安装。相机发布服务和策略服务器为独立服务。
+## 运行
 
-## 目录与提取来源
-
-- `robot_ctrl/dds.py`：从 robotskills 绘画后端提取，保留接管、状态时效、限速、故障保持；增加动作超时和动态夹爪。
-- `robot_ctrl/kinematics.py`：从绘画运动学实现改写，支持完整 G1D URDF、连续轮关节、可配置腰部映射、双臂 IK、FK 与重力前馈。
-- `robot_ctrl/agv.py`、`chassis.py`：提取导航项目的 AGV RPC API 和带超时的速度发布；EEF 主程序不发送底盘或升降指令。
-- `robot_ctrl/controller.py`：相对 EEF 动作、工作范围、关节增量和实测到达检查。
-- `utils/`：独立配置、相机持续采集、坐标变换、控制权锁、MessagePack/JSON 编解码和 WebSocket 客户端。
-- `scripts/run_g1d_policy.py`：机器人客户端入口；`scripts/serve_mock_policy.py`：模拟策略服务入口。
-- `assets/g1d/`：固定版本的官方 G1D URDF 及原许可证，数值运动学不需要 mesh。
-- `tests/`、`mock_policy_server.py`：离线测试和模拟策略服务器。
-
-来源及许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。没有移动或修改 robotskills 原文件。
-
-## 安装
-
-真机使用 Linux，推荐单独的 Python 3.10–3.12 环境，避免与原框架的 NumPy/Pinocchio 版本混装。在项目根目录执行：
+在仓库根目录执行。真机使用 Linux、Python 3.10–3.12 和 Unitree SDK2；EEF 逆解需要带 `pinocchio.casadi` 绑定的 Pinocchio 和 CasADi/IPOPT。先启动机器人的三路相机发布服务。
 
 ```bash
-conda create -n unitree_openpi python=3.11 -y
-conda activate unitree_openpi
-pip install -r unitree_openpi/requirements.txt
+python -m pip install -r unitree_openpi/requirements.txt
+# 云端联调：启动模拟策略；正式运行时换成实际策略服务
+python unitree_openpi/scripts/serve_mock_policy.py --host 192.168.66.200 --port 8000
+# 机器人：上传真实观测并校验一轮回复
+python unitree_openpi/scripts/run_g1d_client.py --url ws://192.168.66.200:8000 --max-steps 1
+# 机器人：持续执行云端动作
+python unitree_openpi/scripts/run_g1d_client.py --url ws://192.168.66.200:8000 --execute
+# 机器人：打印云端动作，双臂只向本地自然下垂位移动
+python unitree_openpi/scripts/test_g1d_client.py --url ws://192.168.66.200:8000 --execute
 ```
 
-如果 SDK 的 CycloneDDS 需要单独构建，使用 SDK 官方安装流程设置 `CYCLONEDDS_HOME`。模拟模式只需要 NumPy、SciPy、websockets 和 msgpack；JSON 图像与真实相机额外需要 OpenCV、PyZMQ。
+## WebSocket 数据协议
 
-## 先运行离线闭环
+机器人主动连接 `policy.url`（`ws://` 或 `wss://`）。默认 `protocol=openpi`，每条消息是一帧二进制 MessagePack，NumPy 数组使用 OpenPI 编码。配置了 `OPENPI_API_KEY` 时，握手带 `Authorization: Api-Key <key>`。
 
-分别在两个终端、项目根目录运行：
+1. **云端 → 机器人**：连接后先发 metadata 字典，允许空字典 `{}`。
+2. **机器人 → 云端**：发送一条 observation，默认字段如下。
+3. **云端 → 机器人**：返回一条带 `actions` 的字典。执行结果随下一条 observation 的 `_unitree.last_action` 返回。
+
+| 观测字段 | 默认内容 |
+|---|---|
+| `observation/state` | `float32[14]`，左 7 后右 7：每臂 `[x,y,z,rx,ry,rz,g]`。位置（m）和旋转向量（rad）均为相对 `torso_link` 的绝对位姿，g 为实测归一化夹爪开度 |
+| `observation/images/high`、`observation/images/left_wrist`、`observation/images/right_wrist` | 三个顶层字符串键，各为 `uint8[224,224,3]` RGB、HWC 图像。high 默认取头部双目左半幅 |
+| `prompt` | 任务字符串，默认空串 |
+| `_unitree` | `sequence`、`frame_id`、`received_at`、`state_age_s`、`state_representation`、`action_representation`、`joint_action_representation`、`action_frame`、每路接收时间和序号 `cameras`、`last_action` |
+| `_unitree` 内的实测反馈 | `joint_positions[14]`（rad）、`joint_velocities[14]`（rad/s），均左 7 后右 7。`waist_q3=[yaw,0,pitch]`，`grip_q2` 为左右夹爪原始电机位置 |
+
+| 云端回复（示意） | 动作含义 |
+|---|---|
+| `{"actions": eef}` 或 `{"actions":{"eef": eef}}` | `eef[H,14]`，每臂 `[dx,dy,dz,drx,dry,drz,g_target]`。g_target 为绝对归一化夹爪目标（0 闭、1 开）。平移增量用 m，旋转向量用 rad。每步相对执行前的实测位姿，默认在基座系施加，可配置为工具系 |
+| `{"actions":{"joint_positions": q}}` | `q[H,14]`，绝对关节角（rad），左 7 后右 7，每臂依次为肩 pitch/roll/yaw、肘、腕 roll/pitch/yaw |
+| `{"actions":{"joint_positions": q,"eef": eef}}` | 两者步数相同。逐步用 FK 检查两种目标一致后执行关节目标 |
+
+单步也接受一维数组。默认 `1 ≤ H ≤ 64`，每轮只执行第一步，再采集新观测。回复可带顶层 `observation_id`，其值须等于本次 `_unitree.sequence`。默认观测有效期 2 秒。
+
+夹爪通道索引为 6、13（从零计数）。默认内置 Dex1 电机映射为闭合 0、打开 2.3 rad，可用 `closed_q2` / `open_q2` 按实机标定修改。可选 `protocol=json` 使用文本帧、数字列表和 JPEG 图像对象（`encoding="jpeg_base64"`、`color_space="RGB"`、`shape`、`data`）。
+
+## 可选：笔记本预览与调焦
+
+在机器人运行四画面预览，再在笔记本打开 SSH 隧道。头部左右目取自同一条双目流，可在实际工作距离分别旋转两侧镜头对焦环，对照画面清晰度。
 
 ```bash
-python unitree_openpi/scripts/serve_mock_policy.py --port 8000
-python unitree_openpi/scripts/run_g1d_policy.py --mock --max-steps 10 --prompt "pick up the object"
+cd ~/zhoumy/xr_teleoperate/unitree_robotskills/unitree_gpt6/g1d_gomoku
+PYTHONPATH=src python -m hardware.camera_web \
+  --config config/hardware.example.yaml --host 192.168.123.164 \
+  --cameras cam_left_high cam_right_high cam_right_wrist cam_left_wrist \
+  --web-host 127.0.0.1 --web-port 8081
 ```
 
-默认模拟服务器返回零增量。`--delta-x 0.001` 可测试左末端每次向基座 X 方向移动 1 mm。模拟运动学是测试映射，不代表 G1D 几何。
-
-```bash
-python -m unittest discover -s unitree_openpi/tests -v
-```
-
-## 真机配置与运行
-
-复制 `config/g1d.json` 为 `config/local.json`，修改 DDS 网卡、相机地址和策略 URL，核对设备的电机槽位、腰部模型映射、PD 增益、工具变换及工作范围。示例参数不是现场标定结果。
-
-```bash
-# 只订阅状态和相机，仍与策略通信，不创建 DDS 命令发布器
-python unitree_openpi/scripts/run_g1d_policy.py --config unitree_openpi/config/local.json --prompt "pick up the object"
-
-# 接管并执行策略返回的相对 EEF 动作
-python unitree_openpi/scripts/run_g1d_policy.py --config unitree_openpi/config/local.json --execute --prompt "pick up the object"
-```
-
-相机服务需提前开启三路单消息 JPEG/ZMQ 流。原框架 TeleImager 默认关闭右腕，需启用 `right_wrist_camera.enable_zmq` 并配置设备。默认头部输入为左右拼接双目，取左半；单目请设置 `head_view: "full"`。图像转换为 HWC、uint8、RGB，并保持比例填充到 224×224；分辨率、头部裁剪需与训练数据一致。
-
-G1D DDS 映射来自绘画后端：双臂 15–28，内置 Dex1 为 31/33，腰部 12=yaw、13=pitch，14 不启用。腰部状态向量为 `[yaw,0,pitch]`。启动接管时保留当前双臂、腰部、夹爪姿态，其他电机不启用。
-
-默认 EEF 基座为 **上身基座 `torso_link`**，不是世界坐标或 AGV 地图坐标。FK 与动作始终使用同一个 `model.reference_frame`，随观测明确发送 `frame_id`。如改为 `AGV_link`，必须将 `reference_positions` 中两个升降关节设为实测值，并保证升降位置不变；本程序尚未订阅升降高度或 SLAM 位姿。默认上身基座的 EEF 几何不依赖升降值。腰部反馈通过 `waist_joint_map` 更新，用于全模型重力计算；名称、方向和零点必须匹配设备版本。
-
-## 状态、相对动作与 WebSocket 协议
-
-默认协议遵循 [OpenPI WebSocket 客户端](https://github.com/Physical-Intelligence/openpi/blob/main/packages/openpi-client/src/openpi_client/websocket_client_policy.py)：机器人连接策略服务器，先接收一条 MessagePack metadata，然后循环发送 observation、接收 `{"actions": ndarray}`。NumPy 编码兼容 OpenPI 的 `msgpack_numpy`，不使用 pickle。`OPENPI_API_KEY` 可提供认证。
-
-每次 observation 的默认结构：
-
-```python
-{
-    "state": float32[12],  # 左 xyz+rpy，然后右 xyz+rpy；均为绝对值
-    "images": {
-        "head": uint8[224,224,3],
-        "left_wrist": uint8[224,224,3],
-        "right_wrist": uint8[224,224,3],
-    },
-    "prompt": "task instruction",
-    "_unitree": {
-        "sequence": 1, "frame_id": "torso_link",
-        "joint_positions": [...], "joint_velocities": [...],
-        "waist_q3": [...], "grip_q2": [...],
-        "cameras": {...}, "last_action": {...},
-        # 时间、表示方式和动作坐标系等信息
-    },
-}
-```
-
-默认 `actions` 为 `(T,12)`：
-
-```text
-[left_dx, left_dy, left_dz, left_drx, left_dry, left_drz,
- right_dx,right_dy,right_dz,right_drx,right_dry,right_drz]
-```
-
-平移单位米，旋转单位弧度。**观测中的姿态是 XYZ 欧拉角，动作中的旋转是旋转向量**，不直接相加欧拉角。默认 `action_frame: "base"`：
-
-```text
-p_target = p_measured + delta_p
-R_target = Exp(delta_rotation_vector) @ R_measured
-```
-
-也支持 `action_frame: "tool"`，对应 `p_target = p + R @ delta_p`、`R_target = R @ Exp(delta_rotation_vector)`。每个动作基于执行开始时的实测 FK 位姿，属于逐步增量，不是整个 chunk 都相对于最初 observation 的偏移。
-
-默认 `include_grippers: false`，夹爪保持启动状态。需要夹爪时设为 true，并填写现场标定的 `open_q2` 和 `closed_q2`；状态、动作变为 14 维，各臂六维 EEF 后跟一个夹爪值。夹爪状态和目标都是绝对归一化值：0=closed、1=open，EEF 仍为相对动作。禁止使用未标定的电机单位作为归一化值。
-
-`state_key`、`prompt_key`、`image_keys` 和 `image_container_key` 可映射训练的观测字段；`image_container_key: null` 表示将图像字段放在顶层。**协议兼容不意味着任意 OpenPI checkpoint 都能驱动 G1D**：必须使用按上述维度、图像预处理和相对动作约定训练的模型，或在服务端添加对应适配器。服务端不得再重复执行 delta 化；输出必须是解归一化后的物理单位。
-
-自定义 JSON 对端可设置 `protocol: "json"`，仍需先发送 JSON metadata，再按一问一答通信。状态为数字列表，图像为含 `encoding: "jpeg_base64"` 的对象。模拟服务器增加 `--protocol json` 可联调。
-
-## 执行和反馈
-
-默认每次推理执行 chunk 的第一个动作后重新采样（`execute_steps: 1`）。每个执行目标等待关节反馈达到容差，之后在下一次 observation 的 `_unitree.last_action` 返回 `reached` 或错误；不额外向官方服务器插入 ACK 消息。可配置执行更多步，但每步仍以最新反馈为基准，且整个 chunk 必须在观测有效期内完成。它不是严格固定周期的高频 chunk 播放器。`command_hz` 是上层循环频率上限，DDS 独立以 250 Hz 发布并限制关节速度。
-
-收到回复后检查观测年龄、全 chunk 格式、平移与旋转限幅；每步检查工作范围、IK 误差、关节跳变、求解期间的反馈漂移及动作期限。默认每步平移≤3 cm、旋转向量模≤0.15 rad，超过限制会拒绝，不静默裁剪。SDK 回调过期、控制模式变化或跟踪故障会进入终止保持。
-
-网络超时、坏动作、相机过期或断连会取消待执行目标，在下一次连接使用新观测，旧回复不重放。底层独立动作超时会保持最后已发布目标，避免推理卡住时继续追踪旧目标。退出不会自动回零；关闭 DDS 后不保证持续带电保持。
-
-本实现没有全身碰撞检测、场景避障或视觉目标识别。实测 FK 状态仍受模型、工具标定和编码器误差影响。相机时间为**主机接收时间**，不是曝光时间；仅检查接收年龄和三路接收时间差，不声明硬件同步。
-
-### Kinematics backend
-
-云端连接示例（将地址替换为实际策略服务）：
-
-```bash
-python unitree_openpi/scripts/run_g1d_policy.py --url wss://policy.example.com --execute
-```
-
-服务端先发送 MessagePack 元数据字典，然后对每帧观测回复一次。
-默认观测含三张 RGB 图像、绝对 EEF `state`、提示词，以及 `_unitree.joint_positions` 中的 14 个实测关节角。
-原有 `{"actions": eef}` 格式继续使用相对 EEF。具名回复支持
-`{"actions": {"joint_positions": joints, "eef": eef}}`，两字段可单独使用。
-`joints` 是 (T,14) 绝对弧度，左臂 7 维在前；`eef` 是 (T,12) 相对位移及旋转向量，启用夹爪时为 (T,14)。
-同时发送时两组轨迹步数须相同，每步用 FK 检查关节目标与相对 EEF 目标一致后才执行关节目标。
-仅发送关节角时夹爪保持原目标。省略 `--execute` 可用真机观测联调。
-
-FK and gravity use Pinocchio. IK uses Pinocchio symbolic FK with CasADi/IPOPT, joint bounds and measured-state initialization. Install CasADi and a Pinocchio build exposing `pinocchio.casadi`; installing `pin` alone does not guarantee those bindings. There is no silent SciPy IK fallback. The full G1D model, measured waist configuration, reference frame and tool transforms are preserved.
-
-### 双臂电机调试脚本
-
-默认 `config/g1d.json` 增益与 `teleop/robot_control/robot_arm.py` 的
-`G1_29_Arm_Internal_Dex1_Controller` 对齐：肩/肘 Kp=80、Kd=3，腕部
-Kp=40、Kd=1.5，腰部 Kp=300、Kd=3，内置夹爪 Kp=5、Kd=0.05。
-这是增益数值对齐；G1D 仍使用自己的两轴腰部槽位映射，不复制 G1 人形机器人的全身映射。
-
-```bash
-# 离线检查（不连接机器人）
-python unitree_openpi/scripts/reset_dual_arms.py --mock
-python unitree_openpi/scripts/swing_dual_arms.py --mock
-
-# 真机；eth0 替换为机器人通信网卡
-python unitree_openpi/scripts/reset_dual_arms.py --execute --interface eth0 --duration 5
-python unitree_openpi/scripts/swing_dual_arms.py --execute
-```
-
-复位沿用 teleop 的零关节角定义（14 维全零，不是末端坐标归零），从实测关节角做平滑插值，
-根据配置速度上限自动延长时间。swing 先平滑进入实测自然下垂位并闭爪，然后无限循环。
-前 4 秒平滑到前抬位并开爪（相对 reset 零位，左右肩俯仰均为 −30°，其余臂关节为零），保持 1 秒，再用 4 秒返回下垂位并闭爪，保持 1 秒。保持阶段持续发布端点目标，Ctrl+C 停止发布。
-内置 Dex1 默认闭合 0、张开 2.3 rad，可通过 policy.closed_q2 和 policy.open_q2 覆盖。
-swing 只启用双臂和夹爪。两个脚本均使用 G1DDSBackend 的 250 Hz LowCmd、
-CRC、状态超时、跟踪检查和限速，以及 Pinocchio 重力前馈。无需相机、WebSocket 或 IK/CasADi。
-真机需要 Pinocchio 和 Unitree SDK；模拟模式使用假模型。
-
-正常完成后默认持续发送保持命令，Ctrl+C 释放 DDS；`--release-on-finish` 可选择完成即退出。
-退出后不再提供主动保持。异常或中断时取消待执行目标并关闭连接，不自动回零。
-同一台机器人不要同时运行 teleop、robotskills 控制服务或其他 LowCmd 发布者；本包锁仅协调使用相同锁文件的进程。
-脚本检查关节限位，但不做碰撞检测。真机动作需在双臂运动空间清空的情况下执行。
+笔记本执行 `ssh -N -L 8081:127.0.0.1:8081 unitree@ROBOT_IP`，浏览器打开 `http://127.0.0.1:8081`。

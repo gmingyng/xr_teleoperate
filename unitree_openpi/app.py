@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 import threading
 import time
+import numpy as np
 
 from .robot_ctrl.controller import EEFController, parse_policy_chunk
 from .utils.cameras import CameraCapture, MockCameras
@@ -32,7 +33,7 @@ def observation(controller, cameras, config, sequence, prompt):
     earliest = min(state_received, *(f["received_monotonic_s"] for f in frames.values()))
     result["_unitree"] = {
         "sequence": sequence, "received_at": time.time(), "frame_id": controller.kin.frame_id,
-        "state_representation": "absolute_xyz_euler_xyz_radians",
+        "state_representation": "absolute_xyz_rotation_vector_radians",
         "action_representation": "delta_xyz_rotation_vector_radians",
         "joint_action_representation": "absolute_joint_radians_left7_right7",
         "action_frame": settings["action_frame"],
@@ -46,7 +47,18 @@ def observation(controller, cameras, config, sequence, prompt):
     return result, earliest
 
 
-def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None):
+def hanging_step(controller, expires):
+    from .robot_ctrl.postures import HANGING
+    state, _ = controller.snapshot()
+    motion = controller.config["motion"]
+    delta = HANGING - state["q14"]
+    distance = float(np.max(np.abs(delta)))
+    step = min(motion["max_joint_step_rad"], motion["max_speed_rad_s"] / motion["command_hz"])
+    target = HANGING if distance <= step else state["q14"] + delta * (step / distance)
+    return controller.apply(None, expires, joint_positions=target)
+
+
+def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, hanging_test=False):
     stop = threading.Event() if stop is None else stop
     client = PolicyClient(config["policy"])
     sequence, completed = 0, 0
@@ -68,6 +80,16 @@ def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None):
                 expires = observed + settings["max_observation_age_s"]
                 if time.monotonic() >= expires:
                     raise TimeoutError("policy response is older than max_observation_age_s")
+                if hanging_test:
+                    if "actions" not in response:
+                        raise ValueError("policy response is missing actions")
+                    print(f"Cloud actions [{sequence}]: {response['actions']}", flush=True)
+                    status = hanging_step(controller, min(expires,
+                        time.monotonic() + config["motion"]["action_timeout_s"]))
+                    controller.last_action = dict(status, observation_id=sequence, target="local_hanging")
+                    completed += 1
+                    stop.wait(max(0, 1 / config["motion"]["command_hz"] - (time.monotonic()-started)))
+                    continue
                 eef, joints = parse_policy_chunk(response, settings)
                 if eef is not None:
                     controller.validate_deltas(eef)
@@ -111,7 +133,7 @@ def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None):
     return completed
 
 
-def main(argv=None):
+def main(argv=None, *, hanging_test=False):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(Path(__file__).parent / "config/g1d.json"))
     parser.add_argument("--url", help="OpenPI policy ws://HOST:PORT URL")
@@ -137,11 +159,13 @@ def main(argv=None):
         from .robot_ctrl.kinematics import G1DKinematics
         backend, kin = G1DDSBackend(config), G1DKinematics(config)
         cameras = CameraCapture(config["cameras"])
-    controller = EEFController(config, backend, kin, execute=args.execute or args.mock)
+    controller = EEFController(config, backend, kin, execute=args.execute or args.mock,
+                               control_waist=not hanging_test)
     lease = ControllerLease(config["device"]["controller_lock"]) if args.execute and not args.mock else nullcontext()
     try:
         with lease:
-            run(config, controller, cameras, prompt=args.prompt, max_steps=args.max_steps)
+            run(config, controller, cameras, prompt=args.prompt, max_steps=args.max_steps,
+                hanging_test=hanging_test)
     except KeyboardInterrupt:
         log.info("Stopped")
     return 0

@@ -4,7 +4,9 @@ import time
 
 import numpy as np
 
-from ..utils.transforms import matrix_pose, relative_target, vector
+from scipy.spatial.transform import Rotation
+
+from ..utils.transforms import relative_target, vector
 
 
 def parse_actions(response, settings):
@@ -46,9 +48,10 @@ def parse_policy_chunk(response, settings):
 
 
 class EEFController:
-    def __init__(self, config, backend, kinematics, execute=False):
+    def __init__(self, config, backend, kinematics, execute=False, *, control_waist=True):
         self.config, self.backend, self.kin = config, backend, kinematics
         self.execute = execute
+        self.control_waist = control_waist
         self.last_action = {"status": "idle"}
 
     def connect(self):
@@ -56,7 +59,7 @@ class EEFController:
         state, _ = self.snapshot()
         if self.execute:
             self.backend.acquire(state["grip_q2"], state["waist_q3"],
-                                 self.kin.gravity(state["q14"]))
+                                 self.kin.gravity(state["q14"]), control_waist=self.control_waist)
 
     def snapshot(self):
         state = self.backend.read()
@@ -68,7 +71,8 @@ class EEFController:
         values = []
         settings = self.config["policy"]
         for index, side in enumerate(("left", "right")):
-            values.extend(matrix_pose(poses[side]))
+            values.extend(poses[side][:3, 3])
+            values.extend(Rotation.from_matrix(poses[side][:3, :3]).as_rotvec())
             if settings["include_grippers"]:
                 closed, opened = settings["closed_q2"][index], settings["open_q2"][index]
                 values.append(float(np.clip((state["grip_q2"][index]-closed)/(opened-closed), 0, 1)))

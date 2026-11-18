@@ -53,7 +53,7 @@ class RelativeActions(unittest.TestCase):
         try:
             backend.q[0] = .02
             before = ctrl.kin.fk(backend.q)
-            action = np.zeros(12)
+            action = np.zeros(14)
             action[0] = .01
             result = ctrl.apply(action, time.monotonic() + 1)
             after = ctrl.kin.fk(backend.q)
@@ -66,14 +66,14 @@ class RelativeActions(unittest.TestCase):
     def test_invalid_stale_and_outside_workspace_do_not_publish(self):
         ctrl, backend = controller()
         try:
-            for action in (np.full(12, np.nan), np.r_[.5, np.zeros(11)]):
+            for action in (np.full(14, np.nan), np.r_[.5, np.zeros(13)]):
                 with self.assertRaises(ValueError):
                     ctrl.apply(action, time.monotonic() + 1)
             with self.assertRaises(TimeoutError):
-                ctrl.apply(np.zeros(12), time.monotonic() - 1)
+                ctrl.apply(np.zeros(14), time.monotonic() - 1)
             ctrl.config["model"]["workspace"]["left"][1][0] = .1
             with self.assertRaises(ValueError):
-                ctrl.apply(np.zeros(12), time.monotonic() + 1)
+                ctrl.apply(np.zeros(14), time.monotonic() + 1)
             self.assertFalse(backend.commands)
         finally:
             ctrl.close()
@@ -87,7 +87,7 @@ class RelativeActions(unittest.TestCase):
         ctrl.kin.solve = slow
         try:
             with self.assertRaises(TimeoutError):
-                ctrl.apply(np.zeros(12), time.monotonic() + .01)
+                ctrl.apply(np.zeros(14), time.monotonic() + .01)
             self.assertFalse(backend.commands)
         finally:
             ctrl.close()
@@ -97,7 +97,7 @@ class RelativeActions(unittest.TestCase):
         ctrl.kin.solve = lambda targets, seed: seed + 1
         try:
             with self.assertRaisesRegex(ValueError, "joint step"):
-                ctrl.apply(np.zeros(12), time.monotonic() + 1)
+                ctrl.apply(np.zeros(14), time.monotonic() + 1)
             self.assertFalse(backend.commands)
         finally:
             ctrl.close()
@@ -105,7 +105,7 @@ class RelativeActions(unittest.TestCase):
     def test_observation_mode_never_acquires_or_commands(self):
         ctrl, backend = controller(execute=False)
         try:
-            result = ctrl.apply(np.zeros(12), time.monotonic() + 1)
+            result = ctrl.apply(np.zeros(14), time.monotonic() + 1)
             self.assertEqual(result["status"], "observing")
             self.assertFalse(backend.acquired)
             self.assertFalse(backend.commands)
@@ -122,7 +122,7 @@ class RelativeActions(unittest.TestCase):
             ctrl.apply(action, time.monotonic() + 1)
             np.testing.assert_allclose(backend.grip, [.5, -1.5])
             obs, _ = observation(ctrl, MockCameras(settings["cameras"]), settings, 1, "test")
-            np.testing.assert_allclose(obs["state"][[6, 13]], [.25, .75])
+            np.testing.assert_allclose(obs["observation/state"][[6, 13]], [.25, .75])
             bad = action.copy()
             bad[6] = 2
             with self.assertRaises(ValueError):
@@ -161,13 +161,17 @@ class WireProtocol(unittest.TestCase):
         ctrl, backend = controller()
         try:
             backend.q[0] = .05
+            backend.q[3:6] = [.2, -.3, .4]
             settings = config()
             ctrl.last_action = {"status": "reached", "observation_id": 1}
             obs, created = observation(ctrl, MockCameras(settings["cameras"]), settings, 2, "pick")
-            self.assertAlmostEqual(float(obs["state"][0]), .35)
-            self.assertEqual(set(obs["images"]), {"head", "left_wrist", "right_wrist"})
-            self.assertEqual(obs["images"]["head"].shape, (224, 224, 3))
-            self.assertEqual(obs["images"]["head"].dtype, np.uint8)
+            self.assertAlmostEqual(float(obs["observation/state"][0]), .35)
+            self.assertEqual(obs["observation/state"].shape, (14,))
+            np.testing.assert_allclose(obs["observation/state"][3:6], Rotation.from_euler("xyz", [.2, -.3, .4]).as_rotvec(), atol=1e-6)
+            self.assertEqual({key for key in obs if key.startswith("observation/images/")},
+                             {"observation/images/high", "observation/images/left_wrist", "observation/images/right_wrist"})
+            self.assertEqual(obs["observation/images/high"].shape, (224, 224, 3))
+            self.assertEqual(obs["observation/images/high"].dtype, np.uint8)
             self.assertEqual(obs["_unitree"]["last_action"]["status"], "reached")
             self.assertLessEqual(created, time.monotonic())
         finally:
@@ -296,7 +300,7 @@ class EndToEnd(unittest.TestCase):
                 joints[0] += .01
                 actions = {"joint_positions": joints[None]}
                 if index:
-                    eef = np.zeros((1, 12))
+                    eef = np.zeros((1, 14))
                     eef[0, 0] = .01 if index == 1 else -.01
                     actions["eef"] = eef
                 connection.send(packb({"actions": actions}))
@@ -344,7 +348,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(len(backend.commands), 3)
         self.assertAlmostEqual(backend.q[0], .003, places=7)
         self.assertEqual(received[1]["_unitree"]["last_action"]["status"], "reached")
-        self.assertEqual(received[0]["images"]["right_wrist"].shape, (224, 224, 3))
+        self.assertEqual(received[0]["observation/images/right_wrist"].shape, (224, 224, 3))
 
     def test_late_policy_reply_never_reaches_robot(self):
         settings = config()
@@ -386,8 +390,8 @@ class DeploymentConfig(unittest.TestCase):
 
     def test_invalid_wire_keys_and_uncalibrated_grippers_fail_configuration(self):
         raw = config()
-        for change in (dict(image_container_key="state"), dict(state_key="_unitree"),
-                       dict(include_grippers=True), dict(reconnect_s=-1)):
+        for change in (dict(image_container_key="observation/state"), dict(state_key="_unitree"),
+                       dict(open_q2=None), dict(reconnect_s=-1)):
             settings = copy.deepcopy(raw)
             settings["policy"].update(change)
             with self.assertRaises((ValueError, TypeError)):
