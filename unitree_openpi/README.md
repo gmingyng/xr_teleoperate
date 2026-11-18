@@ -121,6 +121,20 @@ R_target = Exp(delta_rotation_vector) @ R_measured
 
 ### Kinematics backend
 
+云端连接示例（将地址替换为实际策略服务）：
+
+```bash
+python unitree_openpi/scripts/run_g1d_policy.py --url wss://policy.example.com --execute
+```
+
+服务端先发送 MessagePack 元数据字典，然后对每帧观测回复一次。
+默认观测含三张 RGB 图像、绝对 EEF `state`、提示词，以及 `_unitree.joint_positions` 中的 14 个实测关节角。
+原有 `{"actions": eef}` 格式继续使用相对 EEF。具名回复支持
+`{"actions": {"joint_positions": joints, "eef": eef}}`，两字段可单独使用。
+`joints` 是 (T,14) 绝对弧度，左臂 7 维在前；`eef` 是 (T,12) 相对位移及旋转向量，启用夹爪时为 (T,14)。
+同时发送时两组轨迹步数须相同，每步用 FK 检查关节目标与相对 EEF 目标一致后才执行关节目标。
+仅发送关节角时夹爪保持原目标。省略 `--execute` 可用真机观测联调。
+
 FK and gravity use Pinocchio. IK uses Pinocchio symbolic FK with CasADi/IPOPT, joint bounds and measured-state initialization. Install CasADi and a Pinocchio build exposing `pinocchio.casadi`; installing `pin` alone does not guarantee those bindings. There is no silent SciPy IK fallback. The full G1D model, measured waist configuration, reference frame and tool transforms are preserved.
 
 ### 双臂电机调试脚本

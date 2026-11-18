@@ -286,6 +286,35 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(len(backend.commands), 2)
         self.assertAlmostEqual(backend.q[0], .002, places=7)
 
+    def test_named_joint_and_eef_over_socket(self):
+        settings = config()
+        def policy(connection):
+            connection.send(packb({}))
+            for index in range(3):
+                obs = unpackb(connection.recv())
+                joints = np.array(obs["_unitree"]["joint_positions"])
+                joints[0] += .01
+                actions = {"joint_positions": joints[None]}
+                if index:
+                    eef = np.zeros((1, 12))
+                    eef[0, 0] = .01 if index == 1 else -.01
+                    actions["eef"] = eef
+                connection.send(packb({"actions": actions}))
+        backend = MockBackend(settings)
+        ctrl = EEFController(settings, backend, MockKinematics(), execute=True)
+        with serve(policy, "127.0.0.1", 0) as server:
+            settings["policy"]["url"] = f"ws://127.0.0.1:{server.socket.getsockname()[1]}"
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with self.assertRaisesRegex(ValueError, "targets disagree"):
+                    run(settings, ctrl, MockCameras(settings["cameras"]), max_steps=3)
+            finally:
+                server.shutdown()
+                thread.join(timeout=2)
+        self.assertEqual(len(backend.commands), 2)
+        self.assertAlmostEqual(backend.q[0], .02)
+
     def test_openpi_metadata_images_action_and_feedback_over_real_socket(self):
         settings = config()
         received = []

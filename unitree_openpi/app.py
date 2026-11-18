@@ -7,7 +7,7 @@ from pathlib import Path
 import threading
 import time
 
-from .robot_ctrl.controller import EEFController, parse_actions
+from .robot_ctrl.controller import EEFController, parse_policy_chunk
 from .utils.cameras import CameraCapture, MockCameras
 from .utils.config import load_config
 from .utils.ownership import ControllerLease
@@ -34,6 +34,7 @@ def observation(controller, cameras, config, sequence, prompt):
         "sequence": sequence, "received_at": time.time(), "frame_id": controller.kin.frame_id,
         "state_representation": "absolute_xyz_euler_xyz_radians",
         "action_representation": "delta_xyz_rotation_vector_radians",
+        "joint_action_representation": "absolute_joint_radians_left7_right7",
         "action_frame": settings["action_frame"],
         "joint_positions": state["q14"].tolist(), "joint_velocities": state["dq14"].tolist(),
         "waist_q3": state["waist_q3"].tolist(), "grip_q2": state["grip_q2"].tolist(),
@@ -67,16 +68,19 @@ def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None):
                 expires = observed + settings["max_observation_age_s"]
                 if time.monotonic() >= expires:
                     raise TimeoutError("policy response is older than max_observation_age_s")
-                actions = parse_actions(response, settings)
-                controller.validate_deltas(actions)
-                count = min(len(actions), settings["execute_steps"])
-                for index, action in enumerate(actions[:count]):
+                eef, joints = parse_policy_chunk(response, settings)
+                if eef is not None:
+                    controller.validate_deltas(eef)
+                length = len(eef if eef is not None else joints)
+                count = min(length, settings["execute_steps"])
+                for index in range(count):
                     if stop.is_set():
                         break
-                    status = controller.apply(action, min(expires,
-                        time.monotonic() + config["motion"]["action_timeout_s"]))
+                    status = controller.apply(None if eef is None else eef[index], min(expires,
+                        time.monotonic() + config["motion"]["action_timeout_s"]),
+                        joint_positions=None if joints is None else joints[index])
                     controller.last_action = dict(status, observation_id=sequence, step=index,
-                                                  discarded_steps=len(actions)-count)
+                                                  discarded_steps=length-count)
                     if index + 1 < count:
                         stop.wait(1.0 / config["motion"]["command_hz"])
                 completed += 1
