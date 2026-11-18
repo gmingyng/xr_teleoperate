@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/unitreerobotics/unitree_ros",
+  "commit": "157ff950351e5f535e03c5d85a16b7d594b3dbcc",
+  "path": "robots/g1_d_description/g1_d.urdf",
+  "note": "Kinematics only; meshes are not required or bundled."
+}
