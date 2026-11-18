@@ -71,6 +71,7 @@ class G1DDSBackend:
         self._close_errors = []
         self._last_command = None
         self._last_sent_grip = None
+        self._arm_zero_torque = False
 
     def _fault_locked(self, error):
         if self._fault is None:
@@ -149,7 +150,7 @@ class G1DDSBackend:
         result["received_at"] = self._received_wall["arm"]
         return result
 
-    def connect(self):
+    def connect(self, *, snapshot_only=False):
         """Subscribe and await fresh state; do not create command publishers."""
         with self._lock:
             if self._connected or self._closed or self._channels:
@@ -181,6 +182,26 @@ class G1DDSBackend:
                 CRC=CRC,
             )
             ChannelFactoryInitialize(int(self.device["domain_id"]), self.device["interface"])
+            if snapshot_only:
+                topics = [("arm", self.device["lowstate_topic"], LowState_)]
+                if not self._internal:
+                    topics.extend((side, self.device["external_grippers"][side]["state"], MotorStates_)
+                                  for side in SIDES)
+                readers = []
+                for name, topic, message_type in topics:
+                    channel = ChannelSubscriber(topic, message_type)
+                    self._channels.append(channel)
+                    channel.Init()
+                    readers.append((name, channel))
+                deadline = time.monotonic() + self.motion["connect_timeout_s"]
+                for name, channel in readers:
+                    sample = channel.Read(timeout=max(0.0, deadline - time.monotonic()))
+                    if sample is None:
+                        raise RuntimeError(f"no DDS sample for {name}")
+                    self._receive(name, sample)
+                self._snapshot_locked()
+                self._connected = True
+                return
             self._subscribe(self.device["lowstate_topic"], LowState_, "arm")
             if not self._internal:
                 for side in SIDES:
@@ -244,7 +265,7 @@ class G1DDSBackend:
                     self._fault_locked(exc)
                 raise
 
-    def acquire(self, grip_q2, waist_q3, tau14):
+    def acquire(self, grip_q2, waist_q3, tau14, *, arm_zero_torque=False):
         """Acquire current arm posture after checking fixed grip and waist goals."""
         grip = _vector(grip_q2, 2, "gripper target")
         waist = waist_vector(waist_q3, "waist target").copy()
@@ -253,6 +274,9 @@ class G1DDSBackend:
             if self._acquired or self._acquiring or self._stopped or self._closed:
                 raise RuntimeError("backend is already acquired, acquiring, closed or stopped")
             self._acquiring = True
+            self._arm_zero_torque = arm_zero_torque
+            if arm_zero_torque:
+                tau.fill(0)
         try:
             with self._lock:
                 state = self.read()
@@ -337,11 +361,15 @@ class G1DDSBackend:
             motor.mode, motor.q = 1, float(q[source_index])
             motor.kp = float(self.gains[group + "_kp"][source_index])
             motor.kd = float(self.gains[group + "_kd"][source_index])
+            if group == "arm" and self._arm_zero_torque:
+                motor.kp = motor.kd = 0.0
 
     def command(self, q14, tau14, grip_q2=None):
         q, tau = _vector(q14, 14, "arm target"), _vector(tau14, 14, "arm feedforward torque")
         grip = None if grip_q2 is None else _vector(grip_q2, 2, "gripper target")
         with self._lock:
+            if self._arm_zero_torque:
+                raise RuntimeError("position commands disabled in arm zero-torque mode")
             if not self._acquired or self._closed or self._stopped or self._fault:
                 raise RuntimeError(self._fault or "backend is not acquired or has stopped")
             if self._thread is None or not self._thread.is_alive():
@@ -367,7 +395,7 @@ class G1DDSBackend:
             "waist": (state["waist_q3"], self._waist_target, self.motion["waist_tolerance_rad"]),
             "gripper": (state["grip_q2"], self._last_sent_grip, self.motion["grip_tolerance"]),
         }
-        if self._last_sent_q is not None:
+        if self._last_sent_q is not None and not self._arm_zero_torque:
             checks["arm"] = (state["q14"], self._last_sent_q, self.motion["tracking_tolerance_rad"])
         for name, (actual, target, tolerance) in checks.items():
             error = float(np.max(np.abs(actual - target)))

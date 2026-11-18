@@ -60,7 +60,10 @@ def main():
     else:
         backend, kinematics = G1DDSBackend(config), G1DKinematics(config)
     try:
-        backend.connect()
+        if args.mock:
+            backend.connect()
+        else:
+            backend.connect(snapshot_only=True)
         print_state(read_state(backend, kinematics))
     finally:
         backend.close()
