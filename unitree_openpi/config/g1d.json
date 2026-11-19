@@ -44,7 +44,7 @@
     "api_key_env": "OPENPI_API_KEY", "timeout_s": 5.0, "reconnect_s": 1.0,
     "state_key": "observation/state", "prompt_key": "prompt", "image_container_key": null,
     "image_keys": {"head":"observation/images/high", "left_wrist":"observation/images/left_wrist", "right_wrist":"observation/images/right_wrist"},
-    "action_frame": "base", "include_grippers": true,
+    "include_grippers": true,
     "open_q2": [2.3,2.3], "closed_q2": [0,0],
     "max_observation_age_s": 2.0, "execute_steps": 1, "max_chunk_steps": 64
   }

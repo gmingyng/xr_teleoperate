@@ -4,17 +4,17 @@ import logging
 import threading
 import time
 
-from .robot_ctrl.controller import parse_policy_chunk
+from .robot_ctrl.controller import parse_actions
 from .utils.websocket import PolicyClient
 
 log = logging.getLogger(__name__)
 
 
 def observation(controller, cameras, config, sequence, prompt):
-    state, poses = controller.snapshot()
+    state = controller.snapshot()
     frames = cameras.snapshot()
     settings = config["policy"]
-    result = {settings["state_key"]: controller.state_vector(state, poses),
+    result = {settings["state_key"]: controller.state_vector(state),
               settings["prompt_key"]: prompt}
     images = {settings["image_keys"][name]: frame["image"] for name, frame in frames.items()}
     if settings.get("image_container_key"):
@@ -25,11 +25,9 @@ def observation(controller, cameras, config, sequence, prompt):
     state_received = state.get("received_monotonic_s", now)
     earliest = min(state_received, *(f["received_monotonic_s"] for f in frames.values()))
     result["_unitree"] = {
-        "sequence": sequence, "received_at": time.time(), "frame_id": controller.kin.frame_id,
-        "state_representation": "absolute_xyz_rotation_vector_radians",
-        "action_representation": "delta_xyz_rotation_vector_radians",
-        "joint_action_representation": "absolute_joint_radians_left7_right7",
-        "action_frame": settings["action_frame"],
+        "sequence": sequence, "received_at": time.time(), 
+        "state_representation": "absolute_joint_positions",
+        "action_representation": "absolute_joint_positions",
         "joint_positions": state["q14"].tolist(), "joint_velocities": state["dq14"].tolist(),
         "waist_q3": state["waist_q3"].tolist(), "grip_q2": state["grip_q2"].tolist(),
         "state_age_s": now - state_received,
@@ -43,17 +41,14 @@ def observation(controller, cameras, config, sequence, prompt):
 def execute_policy(controller, response, sequence, expires, stop):
     config = controller.config
     settings = config["policy"]
-    eef, joints = parse_policy_chunk(response, settings)
-    if eef is not None:
-        controller.validate_deltas(eef)
-    length = len(eef if eef is not None else joints)
+    actions = parse_actions(response, settings)
+    length = len(actions)
     count = min(length, settings["execute_steps"])
     for index in range(count):
         if stop.is_set():
             break
-        status = controller.apply(None if eef is None else eef[index], min(expires,
-            time.monotonic() + config["motion"]["action_timeout_s"]),
-            joint_positions=None if joints is None else joints[index])
+        status = controller.apply(actions[index], min(expires,
+            time.monotonic() + config["motion"]["action_timeout_s"]))
         controller.last_action = dict(status, observation_id=sequence, step=index,
                                       discarded_steps=length-count)
         if index + 1 < count:

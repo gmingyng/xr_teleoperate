@@ -5,18 +5,21 @@ import logging
 from pathlib import Path
 
 from unitree_openpi.app import run, execute_policy
-from unitree_openpi.robot_ctrl.controller import EEFController
+from unitree_openpi.robot_ctrl.controller import JointController
 from unitree_openpi.utils.cameras import CameraCapture, MockCameras
 from unitree_openpi.utils.config import load_config
 from unitree_openpi.utils.ownership import ControllerLease
 
 log = logging.getLogger(__name__)
+SERVERS = {"cloud": "ws://192.168.66.200:8000", "thor": "ws://192.168.123.166:8000"}
 
 
 def launch(argv=None, *, prompt="", handle_response=execute_policy, control_waist=True):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(Path(__file__).resolve().parents[1] / "config/g1d.json"))
-    parser.add_argument("--url", help="OpenPI policy ws://HOST:PORT URL")
+    endpoint = parser.add_mutually_exclusive_group()
+    endpoint.add_argument("--server", choices=SERVERS, help="select a policy server preset")
+    endpoint.add_argument("--url", help="custom policy ws:// or wss:// URL")
     parser.add_argument("--prompt", default=prompt)
     parser.add_argument("--execute", action="store_true", help="acquire and execute on the real robot")
     parser.add_argument("--mock", action="store_true", help="synthetic robot/cameras; never connects to DDS")
@@ -26,6 +29,8 @@ def launch(argv=None, *, prompt="", handle_response=execute_policy, control_wais
         parser.error("--max-steps cannot be negative")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = load_config(args.config)
+    if args.server:
+        config["policy"]["url"] = SERVERS[args.server]
     if args.url:
         if not args.url.startswith(("ws://", "wss://")):
             parser.error("--url must start with ws:// or wss://")
@@ -39,7 +44,7 @@ def launch(argv=None, *, prompt="", handle_response=execute_policy, control_wais
         from unitree_openpi.robot_ctrl.kinematics import G1DKinematics
         backend, kin = G1DDSBackend(config), G1DKinematics(config)
         cameras = CameraCapture(config["cameras"])
-    controller = EEFController(config, backend, kin, execute=args.execute or args.mock,
+    controller = JointController(config, backend, kin, execute=args.execute or args.mock,
                                control_waist=control_waist)
     lease = ControllerLease(config["device"]["controller_lock"]) if args.execute and not args.mock else nullcontext()
     try:

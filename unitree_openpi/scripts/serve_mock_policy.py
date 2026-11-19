@@ -22,13 +22,13 @@ def main(argv=None):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--protocol", choices=("openpi", "json"), default="openpi")
-    parser.add_argument("--delta-x", type=float, default=0.0,
-                        help="left-arm delta meters per observation, for mock testing")
+    parser.add_argument("--delta-joint", type=float, default=0.0,
+                        help="left shoulder-pitch offset in radians per observation, for mock testing")
     args = parser.parse_args(argv)
-    if not np.isfinite(args.delta_x) or abs(args.delta_x) > 0.01:
-        parser.error("--delta-x must be finite and within +/-0.01m")
+    if not np.isfinite(args.delta_joint) or abs(args.delta_joint) > 0.01:
+        parser.error("--delta-joint must be finite and within +/-0.01m")
     logging.basicConfig(level=logging.INFO)
-    with serve(make_handler(args.protocol, args.delta_x), args.host, args.port,
+    with serve(make_handler(args.protocol, args.delta_joint), args.host, args.port,
                compression=None, max_size=64*1024*1024) as server:
         signal.signal(signal.SIGINT, lambda *_: server.shutdown())
         logging.info("Mock policy listening on ws://%s:%d", args.host, args.port)

@@ -13,7 +13,7 @@ from websockets.sync.server import serve
 
 from unitree_openpi.app import observation, run
 from unitree_openpi.mock_policy_server import make_handler
-from unitree_openpi.robot_ctrl.controller import EEFController, parse_actions
+from unitree_openpi.robot_ctrl.controller import JointController, parse_actions
 from unitree_openpi.robot_ctrl.dds import G1DDSBackend
 from unitree_openpi.robot_ctrl.mock import MockBackend, MockKinematics
 from unitree_openpi.utils.cameras import CameraCapture, MockCameras, prepare_rgb
@@ -31,7 +31,7 @@ def config():
 def controller(settings=None, execute=True):
     settings = config() if settings is None else settings
     backend = MockBackend(settings)
-    ctrl = EEFController(settings, backend, MockKinematics(), execute=execute)
+    ctrl = JointController(settings, backend, MockKinematics(), execute=execute)
     ctrl.connect()
     return ctrl, backend
 
@@ -48,17 +48,17 @@ class RelativeActions(unittest.TestCase):
         np.testing.assert_allclose(base[:3, :3], dr @ current[:3, :3])
         np.testing.assert_allclose(tool[:3, :3], current[:3, :3] @ dr)
 
-    def test_relative_move_uses_measured_pose_and_preserves_other_arm(self):
+    def test_absolute_joint_move_and_preserves_other_arm(self):
         ctrl, backend = controller()
         try:
             backend.q[0] = .02
             before = ctrl.kin.fk(backend.q)
-            action = np.zeros(14)
+            action = np.zeros(16)
             action[0] = .01
             result = ctrl.apply(action, time.monotonic() + 1)
             after = ctrl.kin.fk(backend.q)
             self.assertEqual(result["status"], "reached")
-            np.testing.assert_allclose(after["left"][:3, 3] - before["left"][:3, 3], [.01, 0, 0])
+            np.testing.assert_allclose(after["left"][:3, 3] - before["left"][:3, 3], [-.01, 0, 0])
             np.testing.assert_allclose(before["right"], after["right"])
         finally:
             ctrl.close()
@@ -70,34 +70,35 @@ class RelativeActions(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     ctrl.apply(action, time.monotonic() + 1)
             with self.assertRaises(TimeoutError):
-                ctrl.apply(np.zeros(14), time.monotonic() - 1)
+                ctrl.apply(np.zeros(16), time.monotonic() - 1)
             ctrl.config["model"]["workspace"]["left"][1][0] = .1
             with self.assertRaises(ValueError):
-                ctrl.apply(np.zeros(14), time.monotonic() + 1)
+                ctrl.apply(np.zeros(16), time.monotonic() + 1)
             self.assertFalse(backend.commands)
         finally:
             ctrl.close()
 
-    def test_action_expires_during_ik_and_does_not_publish(self):
+    def test_action_expires_during_validation_and_does_not_publish(self):
         ctrl, backend = controller()
-        original = ctrl.kin.solve
-        def slow(target, seed):
+        original = ctrl.kin.gravity
+        def slow(target):
             time.sleep(.03)
-            return original(target, seed)
-        ctrl.kin.solve = slow
+            return original(target)
+        ctrl.kin.gravity = slow
         try:
             with self.assertRaises(TimeoutError):
-                ctrl.apply(np.zeros(14), time.monotonic() + .01)
+                ctrl.apply(np.zeros(16), time.monotonic() + .01)
             self.assertFalse(backend.commands)
         finally:
             ctrl.close()
 
     def test_joint_jump_is_rejected(self):
         ctrl, backend = controller()
-        ctrl.kin.solve = lambda targets, seed: seed + 1
+        jump = np.zeros(16)
+        jump[3] = 1
         try:
             with self.assertRaisesRegex(ValueError, "joint step"):
-                ctrl.apply(np.zeros(14), time.monotonic() + 1)
+                ctrl.apply(jump, time.monotonic() + 1)
             self.assertFalse(backend.commands)
         finally:
             ctrl.close()
@@ -105,7 +106,7 @@ class RelativeActions(unittest.TestCase):
     def test_observation_mode_never_acquires_or_commands(self):
         ctrl, backend = controller(execute=False)
         try:
-            result = ctrl.apply(np.zeros(14), time.monotonic() + 1)
+            result = ctrl.apply(np.zeros(16), time.monotonic() + 1)
             self.assertEqual(result["status"], "observing")
             self.assertFalse(backend.acquired)
             self.assertFalse(backend.commands)
@@ -114,23 +115,38 @@ class RelativeActions(unittest.TestCase):
 
     def test_grippers_are_absolute_and_calibrated(self):
         settings = config()
-        settings["policy"].update(include_grippers=True, open_q2=[2., -2.], closed_q2=[0., 0.])
+        settings["policy"]["gripper_command_limits"] = [[0., -2.], [2., 0.]]
         ctrl, backend = controller(settings)
         try:
-            action = np.zeros(14)
-            action[[6, 13]] = [.25, .75]
+            action = np.zeros(16)
+            action[[7, 15]] = [.5, -1.5]
             ctrl.apply(action, time.monotonic() + 1)
             np.testing.assert_allclose(backend.grip, [.5, -1.5])
             obs, _ = observation(ctrl, MockCameras(settings["cameras"]), settings, 1, "test")
-            np.testing.assert_allclose(obs["observation/state"][[6, 13]], [.25, .75])
+            np.testing.assert_allclose(obs["observation/state"][[7, 15]], [.5, -1.5])
             bad = action.copy()
-            bad[6] = 2
+            bad[7] = 2.1
             with self.assertRaises(ValueError):
                 parse_actions({"actions": [bad]}, settings["policy"])
         finally:
             ctrl.close()
 
-    def test_complete_chunk_checked_before_execution(self):
+    def test_dex1_accepts_dataset_feedback_and_float32_upper_bound(self):
+        ctrl, backend = controller()
+        try:
+            action = np.zeros(16, dtype=np.float32)
+            action[[7, 15]] = [5.26, 5.4]
+            ctrl.apply(action, time.monotonic() + 1)
+            np.testing.assert_array_equal(backend.grip, [float(action[7]), 5.4])
+            for invalid in (-.001, 5.401):
+                action[7] = invalid
+                with self.assertRaises(ValueError):
+                    ctrl.apply(action, time.monotonic() + 1)
+            self.assertEqual(len(backend.commands), 1)
+        finally:
+            ctrl.close()
+
+    def test_bad_chunk_shape(self):
         settings = config()["policy"]
         for actions in ([[]], np.zeros((65, 12)), np.zeros((1, 13)), [[np.nan]*12]):
             with self.assertRaises(ValueError):
@@ -165,9 +181,9 @@ class WireProtocol(unittest.TestCase):
             settings = config()
             ctrl.last_action = {"status": "reached", "observation_id": 1}
             obs, created = observation(ctrl, MockCameras(settings["cameras"]), settings, 2, "pick")
-            self.assertAlmostEqual(float(obs["observation/state"][0]), .35)
-            self.assertEqual(obs["observation/state"].shape, (14,))
-            np.testing.assert_allclose(obs["observation/state"][3:6], Rotation.from_euler("xyz", [.2, -.3, .4]).as_rotvec(), atol=1e-6)
+            self.assertAlmostEqual(float(obs["observation/state"][0]), .05)
+            self.assertEqual(obs["observation/state"].shape, (16,))
+            np.testing.assert_allclose(obs["observation/state"][3:6], [.2, -.3, .4], atol=1e-6)
             self.assertEqual({key for key in obs if key.startswith("observation/images/")},
                              {"observation/images/high", "observation/images/left_wrist", "observation/images/right_wrist"})
             self.assertEqual(obs["observation/images/high"].shape, (224, 224, 3))
@@ -281,7 +297,7 @@ class EndToEnd(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             backend = MockBackend(settings)
-            ctrl = EEFController(settings, backend, MockKinematics(), execute=True)
+            ctrl = JointController(settings, backend, MockKinematics(), execute=True)
             try:
                 self.assertEqual(run(settings, ctrl, MockCameras(settings["cameras"]), max_steps=2), 2)
             finally:
@@ -290,28 +306,24 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(len(backend.commands), 2)
         self.assertAlmostEqual(backend.q[0], .002, places=7)
 
-    def test_named_joint_and_eef_over_socket(self):
+    def test_absolute_joint_socket_rejects_legacy_eef(self):
         settings = config()
         def policy(connection):
             connection.send(packb({}))
             for index in range(3):
                 obs = unpackb(connection.recv())
-                joints = np.array(obs["_unitree"]["joint_positions"])
+                joints = obs["observation/state"].copy()
                 joints[0] += .01
-                actions = {"joint_positions": joints[None]}
-                if index:
-                    eef = np.zeros((1, 14))
-                    eef[0, 0] = .01 if index == 1 else -.01
-                    actions["eef"] = eef
+                actions = joints[None] if index < 2 else {"eef": joints[None]}
                 connection.send(packb({"actions": actions}))
         backend = MockBackend(settings)
-        ctrl = EEFController(settings, backend, MockKinematics(), execute=True)
+        ctrl = JointController(settings, backend, MockKinematics(), execute=True)
         with serve(policy, "127.0.0.1", 0) as server:
             settings["policy"]["url"] = f"ws://127.0.0.1:{server.socket.getsockname()[1]}"
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
-                with self.assertRaisesRegex(ValueError, "targets disagree"):
+                with self.assertRaisesRegex(ValueError, "absolute joint array"):
                     run(settings, ctrl, MockCameras(settings["cameras"]), max_steps=3)
             finally:
                 server.shutdown()
@@ -322,7 +334,7 @@ class EndToEnd(unittest.TestCase):
     def test_openpi_metadata_images_action_and_feedback_over_real_socket(self):
         settings = config()
         received = []
-        handler = make_handler(delta_x=.001)
+        handler = make_handler(delta_joint=.001)
         def inspect(connection):
             # Exercise the real binary handshake and observation wire format.
             class Proxy:
@@ -338,7 +350,7 @@ class EndToEnd(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             backend = MockBackend(settings)
-            ctrl = EEFController(settings, backend, MockKinematics(), execute=True)
+            ctrl = JointController(settings, backend, MockKinematics(), execute=True)
             try:
                 self.assertEqual(run(settings, ctrl, MockCameras(settings["cameras"]), max_steps=3), 3)
             finally:
@@ -363,7 +375,7 @@ class EndToEnd(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             backend = MockBackend(settings)
-            ctrl = EEFController(settings, backend, MockKinematics(), execute=True)
+            ctrl = JointController(settings, backend, MockKinematics(), execute=True)
             try:
                 with self.assertRaises(TimeoutError):
                     run(settings, ctrl, MockCameras(settings["cameras"]), max_steps=1)

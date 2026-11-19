@@ -1,53 +1,40 @@
-"""Measured absolute EEF observations and bounded relative-action execution."""
+"""Absolute joint-state observations and bounded joint-target execution."""
 
 import time
 
 import numpy as np
 
-from scipy.spatial.transform import Rotation
-
-from ..utils.transforms import relative_target, vector
+from ..utils.transforms import vector
 
 
 def parse_actions(response, settings):
     """Reject a complete malformed chunk before sending its first command."""
     if "actions" not in response:
         raise ValueError("policy response is missing actions")
+    if isinstance(response["actions"], dict):
+        raise ValueError("actions must be an absolute joint array")
     actions = np.asarray(response["actions"], dtype=float)
-    width = 14 if settings["include_grippers"] else 12
+    width = 16 if settings["include_grippers"] else 14
     if actions.ndim == 1:
         actions = actions[None, :]
     if (actions.ndim != 2 or actions.shape[1] != width or not len(actions) or
             len(actions) > settings["max_chunk_steps"] or not np.isfinite(actions).all()):
         raise ValueError(f"actions must be a finite (T,{width}) array")
-    if settings["include_grippers"] and np.any((actions[:, [6, 13]] < 0) |
-                                                               (actions[:, [6, 13]] > 1)):
-        raise ValueError("gripper actions must be absolute normalized values in [0,1]")
+    if settings["include_grippers"]:
+        validate_grip_targets(actions[:, [7, 15]], settings)
     return actions
 
 
-def parse_policy_chunk(response, settings):
-    """Accept standard OpenPI EEF arrays or explicitly named joint/EEF trajectories."""
-    payload = response.get("actions")
-    if not isinstance(payload, dict):
-        return parse_actions(response, settings), None
-    if not payload or set(payload) - {"eef", "joint_positions"}:
-        raise ValueError("named actions require eef and/or joint_positions")
-    eef = parse_actions({"actions": payload["eef"]}, settings) if "eef" in payload else None
-    joints = None
-    if "joint_positions" in payload:
-        joints = np.asarray(payload["joint_positions"], dtype=float)
-        if joints.ndim == 1:
-            joints = joints[None, :]
-        if (joints.ndim != 2 or joints.shape[1] != 14 or not np.isfinite(joints).all()
-                or not 1 <= len(joints) <= settings["max_chunk_steps"]):
-            raise ValueError("joint_positions must be a finite (T,14) array")
-        if eef is not None and len(eef) != len(joints):
-            raise ValueError("joint and EEF trajectories must have equal length")
-    return eef, joints
+def validate_grip_targets(grip, settings):
+    lower, upper = np.asarray(settings["gripper_command_limits"], dtype=float)
+    # Accept the wire's float32 representation of an endpoint, then send the exact bound.
+    if np.any((grip < np.minimum(lower, lower.astype(np.float32))) |
+              (grip > np.maximum(upper, upper.astype(np.float32)))):
+        raise ValueError("gripper motor target outside calibrated limits")
+    return np.clip(grip, lower, upper)
 
 
-class EEFController:
+class JointController:
     def __init__(self, config, backend, kinematics, execute=False, *, control_waist=True):
         self.config, self.backend, self.kin = config, backend, kinematics
         self.execute = execute
@@ -56,7 +43,7 @@ class EEFController:
 
     def connect(self):
         self.backend.connect()
-        state, _ = self.snapshot()
+        state = self.snapshot()
         if self.execute:
             self.backend.acquire(state["grip_q2"], state["waist_q3"],
                                  self.kin.gravity(state["q14"]), control_waist=self.control_waist)
@@ -64,81 +51,48 @@ class EEFController:
     def snapshot(self):
         state = self.backend.read()
         self.kin.update_state(state)
-        poses = self.kin.fk(state["q14"])
-        return state, poses
+        return state
 
-    def state_vector(self, state, poses):
+    def state_vector(self, state):
         values = []
         settings = self.config["policy"]
-        for index, side in enumerate(("left", "right")):
-            values.extend(poses[side][:3, 3])
-            values.extend(Rotation.from_matrix(poses[side][:3, :3]).as_rotvec())
+        for index in range(2):
+            values.extend(state["q14"][7*index:7*index+7])
             if settings["include_grippers"]:
-                closed, opened = settings["closed_q2"][index], settings["open_q2"][index]
-                values.append(float(np.clip((state["grip_q2"][index]-closed)/(opened-closed), 0, 1)))
+                values.append(state["grip_q2"][index])
         return np.asarray(values, dtype=np.float32)
 
-    def validate_deltas(self, actions):
-        stride = 7 if self.config["policy"]["include_grippers"] else 6
-        motion = self.config["motion"]
-        for start in (0, stride):
-            if np.any(np.linalg.norm(actions[:, start:start+3], axis=1) > motion["max_translation_m"]):
-                raise ValueError("relative translation exceeds max_translation_m")
-            if np.any(np.linalg.norm(actions[:, start+3:start+6], axis=1) > motion["max_rotation_rad"]):
-                raise ValueError("relative rotation exceeds max_rotation_rad")
+    def apply(self, action, expires_at):
+        settings = self.config["policy"]
+        row = parse_actions({"actions": action}, settings)[0]
+        if settings["include_grippers"]:
+            return self.apply_joints(np.r_[row[:7], row[8:15]], expires_at, row[[7, 15]])
+        return self.apply_joints(row, expires_at)
 
-    def apply(self, action, expires_at, joint_positions=None):
+    def apply_joints(self, joints, expires_at, grip=None):
         settings, motion = self.config["policy"], self.config["motion"]
-        width, stride = (14, 7) if settings["include_grippers"] else (12, 6)
-        if action is not None:
-            action = vector(action, width, "relative EEF action")
-            self.validate_deltas(action[None])
         if time.monotonic() >= expires_at:
-            raise TimeoutError("action expired before IK")
-        state, poses = self.snapshot()
-        targets = {}
-        if action is not None:
-            targets = {side: relative_target(poses[side], action[start:start+6], settings["action_frame"])
-                       for side, start in (("left", 0), ("right", stride))}
-        if joint_positions is None:
-            if not targets:
-                raise ValueError("missing joint and EEF targets")
-            q = None
-        else:
-            q = vector(joint_positions, 14, "absolute joint positions")
-            actual = self.kin.fk(q)
-            for side, target in targets.items():
-                delta = target[:3, :3].T @ actual[side][:3, :3]
-                angle = np.arccos(np.clip((np.trace(delta)-1)/2, -1, 1))
-                if (np.linalg.norm(actual[side][:3, 3]-target[:3, 3]) >
-                        self.config["model"].get("position_tolerance_m", .003) or
-                        angle > self.config["model"].get("rotation_tolerance_rad", .03)):
-                    raise ValueError("joint and EEF targets disagree")
-            targets = actual
-        for side, target in targets.items():
+            raise TimeoutError("joint target expired")
+        q = vector(joints, 14, "absolute arm joint positions")
+        state = self.snapshot()
+        for side, target in self.kin.fk(q).items():
             lower, upper = np.asarray(self.config["model"]["workspace"][side])
             if np.any(target[:3, 3] < lower) or np.any(target[:3, 3] > upper):
                 raise ValueError(f"{side} target exceeds configured EEF workspace")
-        if q is None:
-            q = self.kin.solve(targets, state["q14"])
         if np.max(np.abs(q - state["q14"])) > motion["max_joint_step_rad"]:
-            raise ValueError("IK joint step exceeds max_joint_step_rad")
+            raise ValueError("joint step exceeds max_joint_step_rad")
         tau = self.kin.gravity(q)
         if time.monotonic() >= expires_at:
-            raise TimeoutError("action expired while computing IK")
+            raise TimeoutError("action expired during target validation")
         # Recheck feedback after a potentially slow numerical solve.
         latest = self.backend.read()
         if np.max(np.abs(latest["q14"] - state["q14"])) > motion["arrival_tolerance_rad"]:
-            raise RuntimeError("robot moved during IK; target must be replanned")
+            raise RuntimeError("robot moved during target validation; target must be replanned")
         if np.max(np.abs(latest["waist_q3"] - state["waist_q3"])) > motion["waist_tolerance_rad"]:
-            raise RuntimeError("waist moved during IK; target must be replanned")
-        grip = None
-        if action is not None and settings["include_grippers"]:
-            normalized = action[[6, 13]]
-            if np.any((normalized < 0) | (normalized > 1)):
-                raise ValueError("normalized gripper values must be in [0,1]")
-            grip = np.array(settings["closed_q2"]) + normalized * (
-                np.array(settings["open_q2"]) - settings["closed_q2"])
+            raise RuntimeError("waist moved during target validation; target must be replanned")
+        if grip is not None:
+            grip = vector(grip, 2, "absolute gripper motor positions")
+            grip = validate_grip_targets(grip, settings)
         if not self.execute:
             return {"status": "observing", "executed": False}
         self.backend.command(q, tau, grip)
