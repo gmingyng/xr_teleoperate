@@ -70,6 +70,9 @@ class EEFController:
     def state_vector(self, state, poses):
         values = []
         settings = self.config["policy"]
+        if settings.get("action_space") == "joint":
+            q, grip = state["q14"], state["grip_q2"]
+            return np.asarray([*q[:7], grip[0], *q[7:], grip[1]], dtype=np.float32)
         for index, side in enumerate(("left", "right")):
             values.extend(poses[side][:3, 3])
             values.extend(Rotation.from_matrix(poses[side][:3, :3]).as_rotvec())
@@ -87,7 +90,7 @@ class EEFController:
             if np.any(np.linalg.norm(actions[:, start+3:start+6], axis=1) > motion["max_rotation_rad"]):
                 raise ValueError("relative rotation exceeds max_rotation_rad")
 
-    def apply(self, action, expires_at, joint_positions=None):
+    def apply(self, action, expires_at, joint_positions=None, *, gripper_positions=None):
         settings, motion = self.config["policy"], self.config["motion"]
         width, stride = (14, 7) if settings["include_grippers"] else (12, 6)
         if action is not None:
@@ -133,6 +136,12 @@ class EEFController:
         if np.max(np.abs(latest["waist_q3"] - state["waist_q3"])) > motion["waist_tolerance_rad"]:
             raise RuntimeError("waist moved during IK; target must be replanned")
         grip = None
+        if gripper_positions is not None:
+            grip = vector(gripper_positions, 2, "absolute gripper positions")
+            lo = np.minimum(settings["closed_q2"], settings["open_q2"])
+            hi = np.maximum(settings["closed_q2"], settings["open_q2"])
+            if np.any((grip < lo) | (grip > hi)):
+                raise ValueError("absolute gripper target outside configured motor endpoints")
         if action is not None and settings["include_grippers"]:
             normalized = action[[6, 13]]
             if np.any((normalized < 0) | (normalized > 1)):

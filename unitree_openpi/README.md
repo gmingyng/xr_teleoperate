@@ -8,19 +8,22 @@
 
 ```bash
 python -m pip install -r unitree_openpi/requirements.txt
-# 云端联调：启动模拟策略；正式运行时换成实际策略服务
-python unitree_openpi/scripts/serve_mock_policy.py --host 192.168.66.200 --port 8000
+# 4090 / openpi
+python -m examples.g1d.main --config pi05_g1d --checkpoint ~/openpi/checkpoints/pi05_g1d/shelf_pp_test/20000
 # 机器人：上传真实观测并校验一轮回复
-python unitree_openpi/scripts/run_g1d_client.py --url ws://192.168.66.200:8000 --max-steps 1
+python unitree_openpi/scripts/run_g1d_client.py --url ws://192.168.66.200:8000 --max-steps 1 --prompt "pick and place the object on the shelf"
 # 机器人：持续执行云端动作
-python unitree_openpi/scripts/run_g1d_client.py --url ws://192.168.66.200:8000 --execute
-# 机器人：打印云端动作，双臂只向本地自然下垂位移动
-python unitree_openpi/scripts/test_g1d_client.py --url ws://192.168.66.200:8000 --execute
+python unitree_openpi/scripts/run_g1d_client.py --url ws://192.168.66.200:8000 --execute --prompt "pick and place the object on the shelf"
+# Read-only test: print predictions without acquiring actuators.
+python unitree_openpi/scripts/test_g1d_client.py --url ws://192.168.66.200:8000 --max-steps 11
 ```
+
 
 ## WebSocket 数据协议
 
 机器人主动连接 `policy.url`（`ws://` 或 `wss://`）。默认 `protocol=openpi`，每条消息是一帧二进制 MessagePack，NumPy 数组使用 OpenPI 编码。配置了 `OPENPI_API_KEY` 时，握手带 `Authorization: Api-Key <key>`。
+
+The joint client requires G1-D absolute joint metadata. State and each action use [left arm 7, raw left gripper, right arm 7, raw right gripper]. Both clients execute cloud targets only with --execute on hardware. The EEF formats below describe the legacy adapter.
 
 1. **云端 → 机器人**：连接后先发 metadata 字典，允许空字典 `{}`。
 2. **机器人 → 云端**：发送一条 observation，默认字段如下。

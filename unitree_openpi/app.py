@@ -1,6 +1,7 @@
 """Robot-side OpenPI client: observe -> infer -> execute -> measured feedback."""
 
 import logging
+import numpy as np
 import threading
 import time
 
@@ -26,8 +27,8 @@ def observation(controller, cameras, config, sequence, prompt):
     earliest = min(state_received, *(f["received_monotonic_s"] for f in frames.values()))
     result["_unitree"] = {
         "sequence": sequence, "received_at": time.time(), "frame_id": controller.kin.frame_id,
-        "state_representation": "absolute_xyz_rotation_vector_radians",
-        "action_representation": "delta_xyz_rotation_vector_radians",
+        "state_representation": "absolute_joint_motor" if settings.get("action_space") == "joint" else "absolute_xyz_rotation_vector_radians",
+        "action_representation": "absolute_joint_motor" if settings.get("action_space") == "joint" else "delta_xyz_rotation_vector_radians",
         "joint_action_representation": "absolute_joint_radians_left7_right7",
         "action_frame": settings["action_frame"],
         "joint_positions": state["q14"].tolist(), "joint_velocities": state["dq14"].tolist(),
@@ -43,6 +44,25 @@ def observation(controller, cameras, config, sequence, prompt):
 def execute_policy(controller, response, sequence, expires, stop):
     config = controller.config
     settings = config["policy"]
+    if settings.get("action_space") == "joint":
+        actions = np.asarray(response["actions"], dtype=float)
+        if (actions.ndim != 2 or actions.shape[1] != 16 or
+                not 1 <= len(actions) <= settings["max_chunk_steps"] or not np.isfinite(actions).all()):
+            raise ValueError("expected a finite (T,16) absolute joint action chunk")
+        if not controller.execute:
+            print(f"Cloud actions [{sequence}] shape={actions.shape} first={actions[0]}", flush=True)
+            controller.last_action = {"status": "observing", "executed": False}
+            return
+        for i, row in enumerate(actions[:settings["execute_steps"]]):
+            if stop.is_set():
+                break
+            deadline = min(expires, time.monotonic() + config["motion"]["action_timeout_s"])
+            status = controller.apply(None, deadline, joint_positions=np.r_[row[:7], row[8:15]],
+                                      gripper_positions=row[[7, 15]])
+            controller.last_action = dict(status, observation_id=sequence, step=i)
+            if i + 1 < min(len(actions), settings["execute_steps"]):
+                stop.wait(1 / config["motion"]["command_hz"])
+        return
     eef, joints = parse_policy_chunk(response, settings)
     if eef is not None:
         controller.validate_deltas(eef)
@@ -72,15 +92,24 @@ def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, handl
             try:
                 if client.connection is None:
                     metadata = client.connect()
+                    if config["policy"].get("action_space") == "joint":
+                        spec = metadata.get("g1d", {})
+                        if any(spec.get(key) != value for key, value in {
+                            "action_space": "joint", "action_representation": "absolute", "state_dim": 16,
+                            "action_dim": 16, "gripper_units": "motor_position",
+                        }.items()):
+                            raise ValueError("server does not advertise the absolute G1-D joint protocol")
                     log.info("Connected to policy (%s)", metadata)
                 sequence += 1
                 obs, observed = observation(controller, cameras, config, sequence, prompt)
+                sent = time.monotonic()
                 response = client.infer(obs)
+                log.info("Observation %d inference round trip %.1f ms", sequence, 1000 * (time.monotonic() - sent))
                 settings = config["policy"]
                 if response.get("observation_id", sequence) != sequence:
                     raise ValueError("action observation_id does not match request")
                 expires = observed + settings["max_observation_age_s"]
-                if time.monotonic() >= expires:
+                if time.monotonic() >= expires and (controller.execute or settings.get("action_space") != "joint"):
                     raise TimeoutError("policy response is older than max_observation_age_s")
                 handle_response(controller, response, sequence, expires, stop)
                 completed += 1

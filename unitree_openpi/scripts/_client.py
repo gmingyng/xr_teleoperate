@@ -26,6 +26,9 @@ def launch(argv=None, *, prompt="", handle_response=execute_policy, control_wais
         parser.error("--max-steps cannot be negative")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = load_config(args.config)
+    config["policy"]["action_space"] = "joint"
+    if not args.execute:
+        config["policy"]["timeout_s"] = max(config["policy"]["timeout_s"], 120)
     if args.url:
         if not args.url.startswith(("ws://", "wss://")):
             parser.error("--url must start with ws:// or wss://")

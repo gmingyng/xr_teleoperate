@@ -11,7 +11,7 @@ from unitree_openpi.scripts._client import launch
 
 
 def main(argv=None):
-    return launch(argv)
+    return launch(argv, control_waist=False)
 
 
 if __name__ == "__main__":
