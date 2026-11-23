@@ -65,8 +65,6 @@ def normalize_config(value, base=None):
         raise ValueError("policy.protocol must be openpi or json")
     if not policy["url"].startswith(("ws://", "wss://")):
         raise ValueError("policy.url must start with ws:// or wss://")
-    if policy.get("action_frame") not in ("base", "tool"):
-        raise ValueError("action_frame must be base or tool")
     for key in ("timeout_s", "max_observation_age_s", "reconnect_s"):
         number = policy[key]
         if type(number) not in (float, int) or not math.isfinite(number) or number <= 0:
@@ -83,6 +81,16 @@ def normalize_config(value, base=None):
             policy[key] = vector(policy[key], 2, key).tolist()
         if np.any(np.array(policy["open_q2"]) == policy["closed_q2"]):
             raise ValueError("gripper open and closed endpoints must differ")
+        if device["gripper_interface"] == "internal":
+            defaults = [[0, 0], [5.4, 5.4]]
+        else:
+            endpoints = [policy["open_q2"], policy["closed_q2"]]
+            defaults = np.sort(endpoints, axis=0)
+        limits = np.asarray(policy.get("gripper_command_limits", defaults), dtype=float)
+        if (limits.shape != (2, 2) or not np.isfinite(limits).all()
+                or np.any(limits[0] >= limits[1])):
+            raise ValueError("gripper_command_limits requires [min_q2, max_q2]")
+        policy["gripper_command_limits"] = limits.tolist()
     if set(cameras["streams"]) != {"head", "left_wrist", "right_wrist"}:
         raise ValueError("exactly head, left_wrist, right_wrist camera streams are required")
     for endpoint in cameras["streams"].values():
