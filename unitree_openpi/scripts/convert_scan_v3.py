@@ -6,7 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from unitree_lerobot.utils.constants import ROBOT_CONFIGS
+from data_processing.constants import ROBOT_CONFIGS
 
 
 def vector(row, key):

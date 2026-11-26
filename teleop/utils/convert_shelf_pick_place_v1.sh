@@ -3,9 +3,9 @@ set -euo pipefail
 base=/home/unitree/g1d_dataset
 name=lerobot_shelf_pick_place_v1
 [[ ! -e "$base/$name" ]] || { echo "Output already exists"; exit 1; }
-tools=/home/unitree/zhoumy/xr_teleoperate/unitree_lerobot
+tools=/home/unitree/zhoumy/xr_teleoperate
 export PATH="/home/unitree/miniconda3/envs/unitree_lerobot/bin:$PATH"
-export PYTHONPATH="$tools:$tools/unitree_lerobot/lerobot/src"
+export PYTHONPATH="$tools:$tools/lerobot/src"
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 export HF_LEROBOT_HOME
 HF_LEROBOT_HOME=$(mktemp -d "$base/.shelf-build-XXXXXX")
@@ -13,9 +13,9 @@ echo "Staging $HF_LEROBOT_HOME"
 python -u - <<'PY'
 import os,json,tempfile
 from pathlib import Path
-from unitree_lerobot.utils.convert_unitree_json_to_lerobot import create_empty_dataset,populate_dataset,DatasetConfig
+from data_processing.convert_unitree_json_to_lerobot import create_empty_dataset,populate_dataset,DatasetConfig
 import pyarrow.parquet as pq
-from unitree_lerobot.utils.constants import ROBOT_CONFIGS
+from data_processing.constants import ROBOT_CONFIGS
 # Shelf recordings: color_2 is the right wrist and color_3 is the left wrist.
 ROBOT_CONFIGS['Unitree_G1_Dex1'].camera_to_image_key.update(
     color_2='cam_right_wrist', color_3='cam_left_wrist',

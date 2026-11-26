@@ -154,7 +154,10 @@ if __name__ == '__main__':
     parser.add_argument("--barcode-scanner", action="store_true", help="Record THOR product scans in _unitree")
     parser.add_argument("--arm-reset-speed", type=float, default=0.5, metavar="RAD_S",
                         help="Per-joint X/A reset target increment per second (default: 0.5 rad/s)")
+    parser.add_argument("--record-format", choices=("raw","lerobot_v3"), default="raw")
     args = parser.parse_args()
+    if args.record_format == "lerobot_v3" and (not args.record or args.ee != "dex1_internal" or args.ipc):
+        parser.error("G1-D v3 recording requires --record --ee dex1_internal and local episode numbering")
     if not np.isfinite(args.arm_reset_speed) or args.arm_reset_speed <= 0:
         parser.error("--arm-reset-speed must be finite and positive")
     if args.barcode_scanner and not args.record:
@@ -410,7 +413,13 @@ if __name__ == '__main__':
                     "arguments": vars(args),
                 },
             }
-            recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
+            writer_type = EpisodeWriter
+            name = args.task_name
+            if args.record_format == "lerobot_v3":
+                from teleop.utils.v3_writer import V3Writer
+                writer_type = V3Writer
+                name += "_lerobot_v3"
+            recorder = writer_type(task_dir = os.path.join(args.task_dir, name),
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
                                      task_steps = args.task_steps,

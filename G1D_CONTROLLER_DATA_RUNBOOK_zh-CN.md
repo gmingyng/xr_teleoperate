@@ -25,7 +25,7 @@
 | 图像服务器 | `192.168.123.164` |
 | 遥操目录 | `/home/unitree/zhoumy/xr_teleoperate/teleop` |
 | 遥操环境 | `tv` |
-| 转换目录 | `/home/unitree/zhoumy/xr_teleoperate/unitree_lerobot` |
+| 转换目录 | `/home/unitree/zhoumy/xr_teleoperate` |
 | 转换环境 | `unitree_lerobot` |
 | 手臂模型 | `G1_29` |
 | 末端执行器 | `dex1_internal` |
@@ -95,12 +95,9 @@
 ### 2.3 LeRobot 转换代码
 
 ```text
-/home/unitree/zhoumy/xr_teleoperate/unitree_lerobot/
-└── unitree_lerobot/
-    ├── utils/
-    │   ├── convert_unitree_json_to_lerobot.py  # 原始 JSON/JPEG 转 LeRobot v3
-    │   └── constants.py                        # 相机映射和机器人字段定义
-    └── lerobot/                                # 随项目固定的 LeRobot 库源码
+/home/unitree/zhoumy/xr_teleoperate/
+├── data_processing/    # 转换器、机器人字段定义和数据编辑工具
+└── lerobot/src/        # 随项目固定的 LeRobot 库源码
 ```
 
 转换运行在 Conda 环境 `unitree_lerobot` 中。不要只复制转换脚本而省略同目录的项目源码，
@@ -358,7 +355,7 @@ episode_NNNN/
 在同一个终端中先完成环境与路径设置：
 
 ```bash
-cd /home/unitree/zhoumy/xr_teleoperate/unitree_lerobot
+cd /home/unitree/zhoumy/xr_teleoperate
 source /home/unitree/miniconda3/etc/profile.d/conda.sh
 conda activate unitree_lerobot
 
@@ -366,8 +363,8 @@ export G1D_DATA_ROOT=/home/unitree/g1d_dataset
 export G1D_TASK_NAME=shelf_pick_place_mixed_v1
 export LEROBOT_REPO_ID=local/g1d_dataset/shelf_pick_place_mixed_v1
 
-export UNITREE_LEROBOT_ROOT=/home/unitree/zhoumy/xr_teleoperate/unitree_lerobot
-export PYTHONPATH="$UNITREE_LEROBOT_ROOT:$UNITREE_LEROBOT_ROOT/unitree_lerobot/lerobot/src:${PYTHONPATH:-}"
+export UNITREE_LEROBOT_ROOT=/home/unitree/zhoumy/xr_teleoperate
+export PYTHONPATH="$UNITREE_LEROBOT_ROOT:$UNITREE_LEROBOT_ROOT/lerobot/src:${PYTHONPATH:-}"
 ```
 
 `PYTHONPATH` 必须保留：当前 Conda 环境的 editable 安装仍指向已经不存在的旧目录。
@@ -421,7 +418,7 @@ PY
 ```bash
 python - <<'PY'
 import lerobot
-from unitree_lerobot.utils.constants import ROBOT_CONFIGS
+from data_processing.constants import ROBOT_CONFIGS
 print("lerobot:", lerobot.__file__)
 assert "Unitree_G1_Dex1" in ROBOT_CONFIGS
 print("[ok] converter imports are ready")
@@ -440,7 +437,7 @@ PY
 ```bash
 export RAW_TASK_DIR="$G1D_DATA_ROOT/$G1D_TASK_NAME"
 export DATASET_ROOT="/home/unitree/.cache/huggingface/lerobot/$LEROBOT_REPO_ID"
-python unitree_lerobot/utils/convert_unitree_json_to_lerobot.py \
+python data_processing/convert_unitree_json_to_lerobot.py \
   --raw-dir "$RAW_TASK_DIR" \
   --repo-id "$LEROBOT_REPO_ID" \
   --robot-type Unitree_G1_Dex1 \

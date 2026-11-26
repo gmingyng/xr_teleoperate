@@ -218,7 +218,7 @@ class EpisodeWriter():
 
     def add_item(self, colors, depths=None, states=None, actions=None,
                  tactiles=None, audios=None, sim_state=None,
-                 timestamps=None, operator=None, quality=None):
+                 timestamps=None, operator=None, quality=None, unitree=None):
         # Increment the item ID
         self.item_id += 1
         # Create the item data dictionary
@@ -239,6 +239,10 @@ class EpisodeWriter():
         if self.scanner:
             ns = timestamps["monotonic_ns"] if timestamps else time.monotonic_ns()
             item_data["_unitree"] = self.scanner.frame(ns)
+        if unitree is not None:
+            if self.scanner:
+                raise ValueError("Use either recorder scanner or external scan metadata")
+            item_data["_unitree"] = dict(unitree)
         self.item_data_queue.put(item_data)
 
     def process_queue(self):

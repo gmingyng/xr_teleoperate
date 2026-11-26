@@ -100,3 +100,11 @@ PYTHONPATH=src python -m hardware.camera_web \
 ```
 
 笔记本执行 `ssh -N -L 8081:127.0.0.1:8081 unitree@192.168.66.47`，浏览器打开 `http://127.0.0.1:8081`。
+
+## G1-D 直接录制为 LeRobot v3
+
+普通遥操在原命令加 `--record --record-format lerobot_v3`，使用内置 Dex1 和四路相机。DAgger 在执行命令中加 `--execute --record-format lerobot_v3`。扫码任务同时使用 `--barcode-scanner`。省略格式参数使用原始 JSON 模式。
+
+输出在原任务目录名后加 `_lerobot_v3`。B+Y 提交或开启普通示范，录制中 A+X 丢弃。DAgger 每次松开全部 Grip 提交一个人工纠错段。退出后等待写入进程结束再拷贝或训练。控制终端使用 tv，写入进程默认使用 ~/miniconda3/envs/unitree_lerobot/bin/python，可通过 LEROBOT_PYTHON 指定解释器。队列满会提示并丢弃当前不完整段。
+
+磁盘 state 为 [scan_success, L7, R7, Lgrip, Rgrip]，action 为 16 维绝对电机目标。每帧另存 episode_s、scan_trigger、barcode_ascii（零填充 ASCII）和左右 clutch。
