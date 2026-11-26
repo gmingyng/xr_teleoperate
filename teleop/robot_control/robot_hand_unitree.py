@@ -1,9 +1,9 @@
 # for dex3-1
-from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize # dds
+from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber # dds
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_                               # idl
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__HandCmd_
 # for gripper
-from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize # dds
+from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber # dds
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_                           # idl
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
 
@@ -18,6 +18,8 @@ from multiprocessing import Process, Array, Value, Lock
 parent2_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(parent2_dir)
 from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
+from teleop.robot_control.dds_utils import wait_for_dds
+from teleop.utils.output_gate import shared_flag_is_set
 from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 
 import logging_mp
@@ -27,13 +29,14 @@ logger_mp = logging_mp.getLogger(__name__)
 Dex3_Num_Motors = 7
 kTopicDex3LeftCommand = "rt/dex3/left/cmd"
 kTopicDex3RightCommand = "rt/dex3/right/cmd"
-kTopicDex3LeftState = "rt/dex3/left/state"
-kTopicDex3RightState = "rt/dex3/right/state"
+kTopicDex3LeftState = "rt/lf/dex3/left/state"
+kTopicDex3RightState = "rt/lf/dex3/right/state"
 
 
 class Dex3_1_Controller:
     def __init__(self, left_hand_array_in, right_hand_array_in, dual_hand_data_lock = None, dual_hand_state_array_out = None,
-                       dual_hand_action_array_out = None, fps = 100.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None):
+                       dual_hand_action_array_out = None, fps = 100.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None,
+                       output_enabled_in = None):
         """
         [note] A *_array type parameter requires using a multiprocessing Array, because it needs to be passed to the internal child process
 
@@ -77,37 +80,39 @@ class Dex3_1_Controller:
         # Shared Arrays for hand states
         self.left_hand_state_array  = Array('d', Dex3_Num_Motors, lock=True)  
         self.right_hand_state_array = Array('d', Dex3_Num_Motors, lock=True)
+        self.hand_sub_ready = False
 
         # initialize subscribe thread
         self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
         self.subscribe_state_thread.daemon = True
         self.subscribe_state_thread.start()
 
-        while True:
-            if any(self.left_hand_state_array) and any(self.right_hand_state_array):
-                break
-            time.sleep(0.01)
-            logger_mp.warning("[Dex3_1_Controller] Waiting to subscribe dds...")
-        logger_mp.info("[Dex3_1_Controller] Subscribe dds ok.")
+        wait_for_dds(lambda: self.hand_sub_ready, "Dex3_1_Controller", timeout=10.0)
 
         hand_control_process = Process(target=self.control_process, args=(left_hand_array_in, right_hand_array_in,  self.left_hand_state_array, self.right_hand_state_array,
-                                                                          dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out, xr_motion_data_ready_in))
+                                                                          dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out, xr_motion_data_ready_in,
+                                                                          output_enabled_in))
         hand_control_process.daemon = True
         hand_control_process.start()
 
         logger_mp.info("Initialize Dex3_1_Controller OK!")
 
     def _subscribe_hand_state(self):
+        left_hand_ready = False
+        right_hand_ready = False
         while True:
             left_hand_msg  = self.LeftHandState_subscriber.Read()
             right_hand_msg = self.RightHandState_subscriber.Read()
-            if left_hand_msg is not None and right_hand_msg is not None:
-                # Update left hand state
+            if left_hand_msg is not None:
                 for idx, id in enumerate(Dex3_1_Left_JointIndex):
                     self.left_hand_state_array[idx] = left_hand_msg.motor_state[id].q
-                # Update right hand state
+                left_hand_ready = True
+            if right_hand_msg is not None:
                 for idx, id in enumerate(Dex3_1_Right_JointIndex):
                     self.right_hand_state_array[idx] = right_hand_msg.motor_state[id].q
+                right_hand_ready = True
+            if left_hand_ready and right_hand_ready:
+                self.hand_sub_ready = True
             time.sleep(0.002)
     
     class _RIS_Mode:
@@ -135,7 +140,8 @@ class Dex3_1_Controller:
         # logger_mp.debug("hand ctrl publish ok.")
     
     def control_process(self, left_hand_array_in, right_hand_array_in, left_hand_state_array, right_hand_state_array,
-                              dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None, xr_motion_data_ready_in = None):
+                              dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None, xr_motion_data_ready_in = None,
+                              output_enabled_in = None):
         self.running = True
 
         left_q_target  = np.full(Dex3_Num_Motors, 0)
@@ -188,6 +194,20 @@ class Dex3_1_Controller:
                 # Read left and right q_state from shared arrays
                 state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
 
+                if not shared_flag_is_set(output_enabled_in):
+                    left_q_target = state_data[:Dex3_Num_Motors].copy()
+                    right_q_target = state_data[Dex3_Num_Motors:].copy()
+                    if dual_hand_state_array_out is not None and dual_hand_action_array_out is not None:
+                        if dual_hand_data_lock is not None:
+                            with dual_hand_data_lock:
+                                dual_hand_state_array_out[:] = state_data
+                                dual_hand_action_array_out[:] = state_data
+                        else:
+                            dual_hand_state_array_out[:] = state_data
+                            dual_hand_action_array_out[:] = state_data
+                    time.sleep(1 / self.fps)
+                    continue
+
                 if xr_motion_data_ready:
                     ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
                     ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
@@ -236,7 +256,9 @@ kTopicGripperRightState = "rt/dex1/right/state"
 
 class Dex1_1_Gripper_Controller:
     def __init__(self, left_gripper_value_in, right_gripper_value_in, dual_gripper_data_lock = None, dual_gripper_state_out = None, dual_gripper_action_out = None, 
-                       filter = True, fps = 200.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None):
+                       filter = True, fps = 200.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None,
+                       left_gripper_squeeze_in = None, right_gripper_squeeze_in = None, dual_trigger_mode = False,
+                       output_enabled_in = None):
         """
         [note] A *_array type parameter requires using a multiprocessing Array, because it needs to be passed to the internal child process
 
@@ -255,6 +277,10 @@ class Dex1_1_Gripper_Controller:
         Unit_Test: Whether to enable unit testing
 
         simulation_mode: Whether to use simulation mode (default is False, which means using real robot)
+
+        left_gripper_squeeze_in / right_gripper_squeeze_in: [input] Squeeze (side trigger) data, only used in dual trigger mode
+
+        dual_trigger_mode: Whether the gripper is driven by the two XR controller triggers instead of the trigger/pinch value
         """
 
         logger_mp.info("Initialize Dex1_1_Gripper_Controller...")
@@ -263,6 +289,7 @@ class Dex1_1_Gripper_Controller:
         self.Unit_Test = Unit_Test
         self.gripper_sub_ready = False
         self.simulation_mode = simulation_mode
+        self.dual_trigger_mode = dual_trigger_mode
         
         if filter and not self.simulation_mode:
             self.smooth_filter = WeightedMovingFilter(np.array([0.5, 0.3, 0.2]), 2)
@@ -289,13 +316,11 @@ class Dex1_1_Gripper_Controller:
         self.subscribe_state_thread.daemon = True
         self.subscribe_state_thread.start()
 
-        while not self.gripper_sub_ready:
-            time.sleep(0.01)
-            logger_mp.warning("[Dex1_1_Gripper_Controller] Waiting to subscribe dds...")
-        logger_mp.info("[Dex1_1_Gripper_Controller] Subscribe dds ok.")
+        wait_for_dds(lambda: self.gripper_sub_ready, "Dex1_1_Gripper_Controller")
 
         self.gripper_control_thread = threading.Thread(target=self.control_thread, args=(left_gripper_value_in, right_gripper_value_in, self.left_gripper_state_value, self.right_gripper_state_value,
-                                                                                         dual_gripper_data_lock, dual_gripper_state_out, dual_gripper_action_out, xr_motion_data_ready_in))
+                                                                                         dual_gripper_data_lock, dual_gripper_state_out, dual_gripper_action_out, xr_motion_data_ready_in,
+                                                                                         left_gripper_squeeze_in, right_gripper_squeeze_in, output_enabled_in))
         self.gripper_control_thread.daemon = True
         self.gripper_control_thread.start()
 
@@ -321,7 +346,8 @@ class Dex1_1_Gripper_Controller:
         # logger_mp.debug("gripper ctrl publish ok.")
     
     def control_thread(self, left_gripper_value_in, right_gripper_value_in, left_gripper_state_value, right_gripper_state_value, dual_hand_data_lock = None, 
-                             dual_gripper_state_out = None, dual_gripper_action_out = None, xr_motion_data_ready_in = None):
+                             dual_gripper_state_out = None, dual_gripper_action_out = None, xr_motion_data_ready_in = None,
+                             left_gripper_squeeze_in = None, right_gripper_squeeze_in = None, output_enabled_in = None):
         self.running = True
         DELTA_GRIPPER_CMD = 0.18     # The motor rotates 5.4 radians, the clamping jaw slide open 9 cm, so 0.6 rad <==> 1 cm, 0.18 rad <==> 3 mm
         THUMB_INDEX_DISTANCE_MIN = 5.0
@@ -331,8 +357,12 @@ class Dex1_1_Gripper_Controller:
         # The maximum initial motor position when the gripper closes before calibration (with the rail stroke calculated as 0.6 cm/rad * 9 rad = 5.4 cm).
         LEFT_MAPPED_MAX = LEFT_MAPPED_MIN + 5.40 
         RIGHT_MAPPED_MAX = RIGHT_MAPPED_MIN + 5.40
-        left_target_action  = (LEFT_MAPPED_MAX - LEFT_MAPPED_MIN) / 2.0
-        right_target_action = (RIGHT_MAPPED_MAX - RIGHT_MAPPED_MIN) / 2.0
+        if self.dual_trigger_mode:
+            left_target_action  = left_gripper_state_value.value
+            right_target_action = right_gripper_state_value.value
+        else:
+            left_target_action  = (LEFT_MAPPED_MAX - LEFT_MAPPED_MIN) / 2.0
+            right_target_action = (RIGHT_MAPPED_MAX - RIGHT_MAPPED_MIN) / 2.0
 
         dq = 0.0
         tau = 0.0
@@ -361,6 +391,11 @@ class Dex1_1_Gripper_Controller:
                     left_gripper_value  = left_gripper_value_in.value
                 with right_gripper_value_in.get_lock():
                     right_gripper_value = right_gripper_value_in.value
+                if self.dual_trigger_mode:
+                    with left_gripper_squeeze_in.get_lock():
+                        left_squeeze_value = left_gripper_squeeze_in.value
+                    with right_gripper_squeeze_in.get_lock():
+                        right_squeeze_value = right_gripper_squeeze_in.value
                 if xr_motion_data_ready_in is not None:
                     with xr_motion_data_ready_in.get_lock():
                         xr_motion_data_ready = xr_motion_data_ready_in.value
@@ -369,7 +404,33 @@ class Dex1_1_Gripper_Controller:
                 # get current dual gripper motor state
                 dual_gripper_state = np.array([left_gripper_state_value.value, right_gripper_state_value.value])
 
-                if xr_motion_data_ready:
+                if not shared_flag_is_set(output_enabled_in):
+                    left_target_action = dual_gripper_state[0]
+                    right_target_action = dual_gripper_state[1]
+                    if dual_gripper_state_out is not None and dual_gripper_action_out is not None:
+                        if dual_hand_data_lock is not None:
+                            with dual_hand_data_lock:
+                                dual_gripper_state_out[:] = dual_gripper_state
+                                dual_gripper_action_out[:] = dual_gripper_state
+                        else:
+                            dual_gripper_state_out[:] = dual_gripper_state
+                            dual_gripper_action_out[:] = dual_gripper_state
+                    time.sleep(1 / self.fps)
+                    continue
+
+                if xr_motion_data_ready and self.dual_trigger_mode:
+                    # trigger value range: [10.0, 0.0], 10.0 means no press, 0.0 means full press
+                    # squeeze value range: [0.0, 1.0],  0.0 means no press, 1.0 means full press
+                    # pressing both or neither keeps the last command, so the gripper holds its grip force
+                    if left_gripper_value < 5.0 and left_squeeze_value < 0.5:        # only left trigger is pressed, gradually close
+                        left_target_action  = np.clip(dual_gripper_state[0] - DELTA_GRIPPER_CMD, LEFT_MAPPED_MIN, LEFT_MAPPED_MAX)
+                    elif left_gripper_value >= 5.0 and left_squeeze_value >= 0.5:    # only left squeeze is pressed, gradually open
+                        left_target_action  = np.clip(dual_gripper_state[0] + DELTA_GRIPPER_CMD, LEFT_MAPPED_MIN, LEFT_MAPPED_MAX)
+                    if right_gripper_value < 5.0 and right_squeeze_value < 0.5:      # only right trigger is pressed, gradually close
+                        right_target_action = np.clip(dual_gripper_state[1] - DELTA_GRIPPER_CMD, RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX)
+                    elif right_gripper_value >= 5.0 and right_squeeze_value >= 0.5:  # only right squeeze is pressed, gradually open
+                        right_target_action = np.clip(dual_gripper_state[1] + DELTA_GRIPPER_CMD, RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX)
+                elif xr_motion_data_ready:
                     # Linear mapping from [0, THUMB_INDEX_DISTANCE_MAX] to gripper action range
                     left_target_action  = np.interp(left_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [LEFT_MAPPED_MIN, LEFT_MAPPED_MAX])
                     right_target_action = np.interp(right_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX])
@@ -404,79 +465,3 @@ class Dex1_1_Gripper_Controller:
 
 class Gripper_JointIndex(IntEnum):
     kGripper = 0
-
-
-if __name__ == "__main__":
-    import argparse
-    from televuer import TeleVuerWrapper
-    from teleimager.client import TeleImageClient
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--xr-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device tracking source')
-    parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire1', 'brainco'], help='Select end effector controller')
-    args = parser.parse_args()
-    logger_mp.info(f"args:{args}\n")
-
-    ChannelFactoryInitialize(1) # 0 for real robot, 1 for simulation
-    
-    # image client
-    img_server_ip = '127.0.0.1' #'192.168.123.164'
-    camera_config, from_server = TeleImageClient.scan(img_server_ip)
-    if not from_server:
-        raise RuntimeError("Image server is unreachable; cached camera configuration is not accepted.")
-    if 'head_camera' not in camera_config:
-        raise RuntimeError("Head camera is required. Please enable head camera on the image server side.")
-    head_camera_config = camera_config['head_camera']
-    if not head_camera_config.get('enable_zmq'):
-        raise RuntimeError("Head camera ZMQ is disabled. Set enable_zmq: true for head_camera in the image server config.")
-    head_img_shape = head_camera_config['image_shape']
-    tv_binocular = head_camera_config.get('binocular', False)
-    head_img_client = TeleImageClient('head_camera', server_host=img_server_ip,
-                                      zmq_port=head_camera_config['zmq_port'], request_bgr=True)
-
-    # television: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
-    tv_wrapper = TeleVuerWrapper(binocular=tv_binocular, use_hand_tracking=args.xr_mode == "hand", img_shape=head_img_shape, return_hand_rot_data = False)
-
-# end-effector
-    if args.ee == "dex3":
-        left_hand_pos_array = Array('d', 75, lock = True)      # [input]
-        right_hand_pos_array = Array('d', 75, lock = True)     # [input]
-        dual_hand_data_lock = Lock()
-        dual_hand_state_array = Array('d', 14, lock = False)   # [output] current left, right hand state(14) data.
-        dual_hand_action_array = Array('d', 14, lock = False)  # [output] current left, right hand action(14) data.
-        hand_ctrl = Dex3_1_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array)
-    elif args.ee == "dex1":
-        left_gripper_value = Value('d', 0.0, lock=True)        # [input]
-        right_gripper_value = Value('d', 0.0, lock=True)       # [input]
-        dual_gripper_data_lock = Lock()
-        dual_gripper_state_array = Array('d', 2, lock=False)   # current left, right gripper state(2) data.
-        dual_gripper_action_array = Array('d', 2, lock=False)  # current left, right gripper action(2) data.
-        gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, dual_gripper_state_array, dual_gripper_action_array)
-
-    user_input = input("Please enter the start signal (enter 's' to start the subsequent program):\n")
-    if user_input.lower() == 's':
-        while True:
-            head_img = head_img_client.get_frame()
-            tv_wrapper.render_to_xr(head_img.bgr)
-            tele_data = tv_wrapper.get_tele_data()
-            if args.ee == "dex3" and args.xr_mode == "hand":
-                with left_hand_pos_array.get_lock():
-                    left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
-                with right_hand_pos_array.get_lock():
-                    right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
-            elif args.ee == "dex1" and args.xr_mode == "controller":
-                with left_gripper_value.get_lock():
-                    left_gripper_value.value = tele_data.left_ctrl_triggerValue
-                with right_gripper_value.get_lock():
-                    right_gripper_value.value = tele_data.right_ctrl_triggerValue
-            elif args.ee == "dex1" and args.xr_mode == "hand":
-                with left_gripper_value.get_lock():
-                    left_gripper_value.value = tele_data.left_hand_pinchValue
-                with right_gripper_value.get_lock():
-                    right_gripper_value.value = tele_data.right_hand_pinchValue
-            else:
-                pass
-
-            # with dual_hand_data_lock:
-            #     logger_mp.info(f"state : {list(dual_hand_state_array)} \naction: {list(dual_hand_action_array)} \n")
-            time.sleep(0.01)

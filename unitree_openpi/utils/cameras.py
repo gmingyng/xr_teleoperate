@@ -82,11 +82,14 @@ class CameraCapture:
                         if bgr is None:
                             raise ValueError("invalid JPEG")
                         rgb = prepare_rgb(bgr, name, self.settings)
+                        extra = {}
+                        if name == "head" and self.settings.get("record_right_eye"):
+                            extra["review_right_eye"] = prepare_rgb(bgr, name, dict(self.settings, head_view="right"))
                         with self._lock:
                             previous = self._frames.get(name)
                             seq = 1 if previous is None else previous["sequence"] + 1
                             self._frames[name] = dict(image=rgb, sequence=seq,
-                                received_monotonic_s=received, received_at=wall)
+                                received_monotonic_s=received, received_at=wall, **extra)
                             self._errors.pop(name, None)
                     except (ValueError, cv2.error) as exc:
                         with self._lock:

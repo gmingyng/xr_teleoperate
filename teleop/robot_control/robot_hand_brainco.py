@@ -3,6 +3,7 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_     
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
 
 from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
+from teleop.robot_control.dds_utils import wait_for_dds
 import numpy as np
 from enum import IntEnum
 import threading
@@ -17,6 +18,13 @@ kTopicbraincoLeftCommand = "rt/brainco/left/cmd"
 kTopicbraincoLeftState = "rt/brainco/left/state"
 kTopicbraincoRightCommand = "rt/brainco/right/cmd"
 kTopicbraincoRightState = "rt/brainco/right/state"
+
+# 拇指-食指指尖精确接触标定比例（Mujoco FK 验证通过）
+PINCH_RATIOS = {
+    0: 0.580,  # thumb 弯曲  — 1.1066 rad (63.4°)
+    1: 0.670,  # thumb 对掌  — 0.7455 rad (42.7°)
+    2: 0.470,  # index 弯曲  — 0.6212 rad (35.6°)
+}
 
 class Brainco_Controller_ctrl:
     def __init__(self, left_gripper_trigger_in, left_gripper_squeeze_in, right_gripper_trigger_in, right_gripper_squeeze_in, 
@@ -53,10 +61,7 @@ class Brainco_Controller_ctrl:
         self.subscribe_state_thread.daemon = True
         self.subscribe_state_thread.start()
 
-        while not self.hand_sub_ready:
-            time.sleep(0.1)
-            logger_mp.warning("[Brainco_Controller_ctrl] Waiting to subscribe dds...")
-        logger_mp.info("[Brainco_Controller_ctrl] Subscribe dds ok.")
+        wait_for_dds(lambda: self.hand_sub_ready, "Brainco_Controller_ctrl")
 
         hand_control_process = Process(target=self.control_process, args=(left_gripper_trigger_in, left_gripper_squeeze_in, right_gripper_trigger_in, right_gripper_squeeze_in, 
                                                                           self.left_hand_state_array, self.right_hand_state_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array,
@@ -132,26 +137,26 @@ class Brainco_Controller_ctrl:
                         xr_motion_data_ready = xr_motion_data_ready_in.value
                 else:
                     xr_motion_data_ready = True
-
                 state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
 
                 if xr_motion_data_ready:
-                    # In the official document, the angles are in the range [0, 1] ==> 0.0: fully open  1.0: fully closed
-                    left_triger_value = (10.0 - left_trigger_value) / 10.0
-                    left_q_target[0]  = np.clip((left_triger_value - 0.5) / 0.5, 0.0, 0.98) # thumb-aux
-                    left_q_target[1]  = np.clip(left_triger_value / 0.5, 0.0, 0.7) # thumb
-                    left_q_target[2]  = np.clip(left_squeeze_value, 0.0, 0.98)                   # index
-                    left_q_target[3]  = np.clip(left_triger_value, 0.0, 0.98)   # middle
-                    left_q_target[4]  = np.clip(left_triger_value, 0.0, 0.98)   # ring
-                    left_q_target[5]  = np.clip(left_triger_value, 0.0, 0.98)   # pinky
+                    # trigger: [10→0]→[0→1], squeeze: [0→1]
+                    lt = (10.0 - left_trigger_value) / 10.0
+                    rt = (10.0 - right_trigger_value) / 10.0
 
-                    right_triger_value = (10.0 - right_trigger_value) / 10.0
-                    right_q_target[0] = np.clip((right_triger_value - 0.5) / 0.5, 0.0, 0.98)
-                    right_q_target[1] = np.clip(right_triger_value / 0.5, 0.0, 0.7)
-                    right_q_target[2] = np.clip(right_squeeze_value, 0.0, 0.98)                  # index
-                    right_q_target[3] = np.clip(right_triger_value, 0.0, 0.98)  # middle
-                    right_q_target[4] = np.clip(right_triger_value, 0.0, 0.98)  # ring
-                    right_q_target[5] = np.clip(right_triger_value, 0.0, 0.98)  # pinky
+                    # ---- Trigger → thumb(0,1) + index(2) : precision pinch ----
+                    # FK-verified: at t=1.0, thumb_tip ≈ index_tip (<1mm)
+                    for t, q in ((lt, left_q_target), (rt, right_q_target)):
+                        q[0] = (1.0 - (1.0 - t) ** 2) * PINCH_RATIOS[0]  # CMC opposition
+                        q[1] = t                      * PINCH_RATIOS[1]  # thumb flexion
+                        q[2] = t                      * PINCH_RATIOS[2]  # index flexion
+
+                    # ---- Squeeze → middle(3) + ring(4) + pinky(5) : power grasp ----
+                    for s, q in ((left_squeeze_value, left_q_target),
+                                  (right_squeeze_value, right_q_target)):
+                        q[3] = s
+                        q[4] = s
+                        q[5] = s
 
                 # get dual hand state
                 action_data = np.concatenate((left_q_target, right_q_target))
@@ -183,7 +188,6 @@ class Brainco_Controller_hand:
         else:
             self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND_Unit_Test)
 
-
         # initialize handcmd publisher and handstate subscriber
         self.LeftHandCmb_publisher = ChannelPublisher(kTopicbraincoLeftCommand, MotorCmds_)
         self.LeftHandCmb_publisher.Init()
@@ -204,10 +208,7 @@ class Brainco_Controller_hand:
         self.subscribe_state_thread.daemon = True
         self.subscribe_state_thread.start()
 
-        while not self.hand_sub_ready:
-            time.sleep(0.1)
-            logger_mp.warning("[Brainco_Controller_hand] Waiting to subscribe dds...")
-        logger_mp.info("[Brainco_Controller_hand] Subscribe dds ok.")
+        wait_for_dds(lambda: self.hand_sub_ready, "Brainco_Controller_hand")
 
         hand_control_process = Process(target=self.control_process, args=(left_hand_array, right_hand_array,  self.left_hand_state_array, self.right_hand_state_array,
                                                                           dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, xr_motion_data_ready_in))

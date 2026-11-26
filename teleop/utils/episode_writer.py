@@ -4,18 +4,40 @@ import json
 import datetime
 import numpy as np
 import time
+from copy import deepcopy
 from .rerun_visualizer import RerunLogger
 from queue import Queue, Empty
-from threading import Thread
+from .recording_schema import BarcodeReceiver
+from threading import Lock, Thread
 import logging_mp
+import re
+import shutil
 logger_mp = logging_mp.getLogger(__name__)
 
+def beep_scan():
+    try:
+        from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+        client = AudioClient()
+        client.SetTimeout(2.0)
+        client.Init()
+        t = np.arange(1920) / 16000
+        env = np.clip(np.minimum(t, 0.12 - t) / 0.005, 0, 1)
+        pcm = (10000 * env * np.sin(2 * np.pi * 1600 * t)).astype("<i2").tobytes()
+        rc, _ = client.PlayStream("scan", str(time.monotonic_ns()), pcm)
+        if rc:
+            logger_mp.warning(f"Scan beep returned {rc}")
+    except Exception as exc:
+        logger_mp.warning(f"Scan beep failed: {exc}")
+
+
 class EpisodeWriter():
-    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True):
+    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None,
+                 frequency=30, image_size=[640, 480], rerun_log = True,
+                 extra_info=None, voice_prompts=False, barcode_scanner=False, scan_beep=False):
         """
         image_size: [width, height]
         """
-        logger_mp.info("==> EpisodeWriter initializing...\n")
+        logger_mp.info("==> EpisodeWriter initializing...")
         self.task_dir = task_dir
         self.text = {
             "goal": "Pick up the red cup on the table.",
@@ -34,21 +56,25 @@ class EpisodeWriter():
 
         self.rerun_log = rerun_log
         if self.rerun_log:
-            logger_mp.info("==> RerunLogger initializing...\n")
+            logger_mp.info("==> RerunLogger initializing...")
             self.rerun_logger = RerunLogger(prefix="online/", IdxRangeBoundary = 60, memory_limit = "300MB")
-            logger_mp.info("==> RerunLogger initializing ok.\n")
+            logger_mp.info("==> RerunLogger initializing ok.")
         
         self.item_id = -1
         self.episode_id = -1
         if os.path.exists(self.task_dir):
-            episode_dirs = [episode_dir for episode_dir in os.listdir(self.task_dir) if 'episode_' in episode_dir and not episode_dir.endswith('.zip')]
-            episode_last = sorted(episode_dirs)[-1] if len(episode_dirs) > 0 else None
-            self.episode_id = 0 if episode_last is None else int(episode_last.split('_')[-1])
-            logger_mp.info(f"==> task_dir directory already exist, now self.episode_id is:{self.episode_id}\n")
+            episode_ids = []
+            for entry in os.listdir(self.task_dir):
+                match = re.fullmatch(r"episode_(\d+)", entry)
+                if match and os.path.isdir(os.path.join(self.task_dir, entry)):
+                    episode_ids.append(int(match.group(1)))
+            self.episode_id = max(episode_ids, default=-1)
+            logger_mp.info(f"==> task_dir directory already exist, now self.episode_id is:{self.episode_id}")
         else:
             os.makedirs(self.task_dir)
-            logger_mp.info(f"==> episode directory does not exist, now create one.\n")
-        self.data_info()
+            logger_mp.info(f"==> episode directory does not exist, now create one.")
+        self.data_info(extra_info=extra_info)
+        self.episode_start_monotonic_ns = None
 
         self.is_available = True  # Indicates whether the class is available for new operations
         # Initialize the queue and worker thread
@@ -56,14 +82,44 @@ class EpisodeWriter():
         self.stop_worker = False
         self.need_save = False  # Flag to indicate when save_episode is triggered
         self.worker_thread = Thread(target=self.process_queue)
+        # Author: mingyang - Queue recording prompts so audio RPCs never block the control loop.
+        self.voice_queue = Queue() if voice_prompts else None
+        if voice_prompts:
+            self.voice_thread = Thread(target=self._play_prompts, name="recording-voice", daemon=True)
+            self.voice_thread.start()
+        notify = (lambda: Thread(target=beep_scan, daemon=True).start()) if scan_beep else None
+        self.scanner = BarcodeReceiver(on_scan=notify) if barcode_scanner else None
+        self.scan_summary = None
         self.worker_thread.start()
 
-        logger_mp.info("==> EpisodeWriter initialized successfully.\n")
+        logger_mp.info("==> EpisodeWriter initialized successfully.")
     
+    def _play_prompts(self):
+        client = None
+        while True:
+            message = self.voice_queue.get()
+            if message is None:
+                return
+            try:
+                if client is None:
+                    from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+                    client = AudioClient()
+                    client.SetTimeout(2.0)
+                    client.Init()
+                    code = client.SetVolume(60)
+                    if code != 0:
+                        raise RuntimeError(f"SetVolume returned {code}")
+                code = client.TtsMaker(message, 0)
+                if code != 0:
+                    raise RuntimeError(f"TtsMaker returned {code}")
+            except Exception as exc:
+                logger_mp.warning(f"Recording voice prompt failed: {exc}")
+                client = None
+
     def is_ready(self):
         return self.is_available
 
-    def data_info(self, version='1.0.0', date=None, author=None):
+    def data_info(self, version='1.0.0', date=None, author=None, extra_info=None):
         self.info = {
                 "version": "1.0.0" if version is None else version, 
                 "date": datetime.date.today().strftime('%Y-%m-%d') if date is None else date,
@@ -85,11 +141,15 @@ class EpisodeWriter():
                 }, 
                 "sim_state": ""
             }
+        if extra_info:
+            self.info.update(deepcopy(extra_info))
 
  
-    def create_episode(self):
+    def create_episode(self, episode_id: int = None):
         """
         Create a new episode.
+        Args:
+            episode_id (int, optional): The starting item ID for the episode. Defaults to None
         Returns:
             bool: True if the episode is successfully created, False otherwise.
         Note:
@@ -101,14 +161,26 @@ class EpisodeWriter():
 
         # Reset episode-related data and create necessary directories
         self.item_id = -1
-        self.episode_id = self.episode_id + 1
-        
-        self.episode_dir = os.path.join(self.task_dir, f"episode_{str(self.episode_id).zfill(4)}")
+        candidate_id = self.episode_id + 1 if episode_id is None else int(episode_id)
+        episode_dir = os.path.join(self.task_dir, f"episode_{str(candidate_id).zfill(4)}")
+        if os.path.exists(episode_dir):
+            logger_mp.error(f"==> Refusing to overwrite existing episode: {episode_dir}")
+            return False
+
+        # Creating the episode directory without exist_ok makes allocation
+        # collision-safe even if another writer races for the same ID.
+        try:
+            os.makedirs(episode_dir, exist_ok=False)
+        except FileExistsError:
+            logger_mp.error(f"==> Episode allocation collision, recording not started: {episode_dir}")
+            return False
+
+        self.episode_id = candidate_id
+        self.episode_dir = episode_dir
         self.color_dir = os.path.join(self.episode_dir, 'colors')
         self.depth_dir = os.path.join(self.episode_dir, 'depths')
         self.audio_dir = os.path.join(self.episode_dir, 'audios')
         self.json_path = os.path.join(self.episode_dir, 'data.json')
-        os.makedirs(self.episode_dir, exist_ok=True)
         os.makedirs(self.color_dir, exist_ok=True)
         os.makedirs(self.depth_dir, exist_ok=True)
         os.makedirs(self.audio_dir, exist_ok=True)
@@ -118,15 +190,35 @@ class EpisodeWriter():
             f.write('"text": ' + json.dumps(self.text, ensure_ascii=False, indent=4) + ',\n')
             f.write('"data": [\n')
         self.first_item = True   # Flag to handle commas in JSON array
+        self.episode_start_monotonic_ns = time.monotonic_ns()
+        if self.scanner:
+            self.scan_summary = None
+            self.scanner.begin(self.episode_start_monotonic_ns)
 
         if self.rerun_log:
             self.online_logger = RerunLogger(prefix="online/", IdxRangeBoundary = 60, memory_limit="300MB")
 
         self.is_available = False  # After the episode is created, the class is marked as unavailable until the episode is successfully saved
         logger_mp.info(f"==> New episode created: {self.episode_dir}")
+        # Author: mingyang - Announce only after the episode was successfully created.
+        if self.voice_queue is not None:
+            self.voice_queue.put_nowait("开始录制")
         return True  # Return True if the episode is successfully created
         
-    def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None):
+    def get_episode_elapsed_s(self, sample_monotonic_ns=None):
+        if self.episode_start_monotonic_ns is None:
+            return None
+        if sample_monotonic_ns is None:
+            sample_monotonic_ns = time.monotonic_ns()
+        return max(
+            0.0,
+            (sample_monotonic_ns - self.episode_start_monotonic_ns)
+            / 1_000_000_000.0,
+        )
+
+    def add_item(self, colors, depths=None, states=None, actions=None,
+                 tactiles=None, audios=None, sim_state=None,
+                 timestamps=None, operator=None, quality=None):
         # Increment the item ID
         self.item_id += 1
         # Create the item data dictionary
@@ -139,8 +231,14 @@ class EpisodeWriter():
             'tactiles': tactiles,
             'audios': audios,
             'sim_state': sim_state,
+            'timestamps': timestamps,
+            'operator': operator,
+            'quality': quality,
         }
         # Enqueue the item data
+        if self.scanner:
+            ns = timestamps["monotonic_ns"] if timestamps else time.monotonic_ns()
+            item_data["_unitree"] = self.scanner.frame(ns)
         self.item_data_queue.put(item_data)
 
     def process_queue(self):
@@ -206,16 +304,66 @@ class EpisodeWriter():
         """
         Trigger the save operation. This sets the save flag, and the process_queue thread will handle it.
         """
+        if self.scanner:
+            self.scan_summary = self.scanner.finish()
         self.need_save = True  # Set the save flag
         logger_mp.info(f"==> Episode saved start...")
+
+    def discard_episode(self):
+        """Discard the active, not-yet-finalized episode and reuse its ID.
+
+        The queue is drained first so the worker cannot still be writing into
+        the directory while it is removed. A normally finalized episode is
+        never discarded by this method.
+        """
+        if self.is_available:
+            logger_mp.info("==> No active episode to discard.")
+            return False
+        if self.need_save:
+            logger_mp.warning("==> Refusing to discard an episode that is already being finalized.")
+            return False
+
+        if self.scanner:
+            self.scanner.finish()
+        self.item_data_queue.join()
+
+        episode_dir = os.path.abspath(self.episode_dir)
+        task_dir = os.path.abspath(self.task_dir)
+        episode_name = os.path.basename(episode_dir)
+        if (
+            os.path.dirname(episode_dir) != task_dir
+            or re.fullmatch(r"episode_\d+", episode_name) is None
+        ):
+            raise RuntimeError(f"Unsafe episode discard path: {episode_dir}")
+
+        if os.path.isdir(episode_dir):
+            shutil.rmtree(episode_dir)
+
+        episode_ids = []
+        for entry in os.listdir(self.task_dir):
+            match = re.fullmatch(r"episode_(\d+)", entry)
+            if match and os.path.isdir(os.path.join(self.task_dir, entry)):
+                episode_ids.append(int(match.group(1)))
+        self.episode_id = max(episode_ids, default=-1)
+        self.item_id = -1
+        self.episode_start_monotonic_ns = None
+        self.is_available = True
+        logger_mp.info(f"==> Active episode discarded: {episode_dir}")
+        return True
 
     def _save_episode(self):
         """
         Save the episode data to a JSON file.
         """
         with open(self.json_path, "a", encoding="utf-8") as f:
-            f.write("\n]\n}")      # Close the JSON array and object
+            f.write("\n]")
+            if self.scan_summary is not None:
+                f.write(',\n"_unitree": ' + json.dumps(self.scan_summary))
+            f.write("\n}")
 
+        # Author: mingyang - Announce after closing data.json, before accepting the next episode.
+        if self.voice_queue is not None:
+            self.voice_queue.put_nowait("已保存")
         self.need_save = False     # Reset the save flag
         self.is_available = True   # Mark the class as available after saving
         logger_mp.info(f"==> Episode saved successfully to {self.json_path}.")
@@ -225,9 +373,14 @@ class EpisodeWriter():
         Stop the worker thread and ensure all tasks are completed.
         """
         self.item_data_queue.join()
-        if not self.is_available:  # If self.is_available is False, it means there is still data not saved.
+        if not self.is_available and not self.need_save:  # If self.is_available is False, it means there is still data not saved.
             self.save_episode()
         while not self.is_available:
             time.sleep(0.01)
         self.stop_worker = True
         self.worker_thread.join()
+        if self.scanner:
+            self.scanner.close()
+        if self.voice_queue is not None:
+            self.voice_queue.put_nowait(None)
+            self.voice_thread.join(timeout=5.0)

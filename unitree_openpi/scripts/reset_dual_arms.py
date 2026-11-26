@@ -13,7 +13,8 @@ from unitree_openpi.robot_ctrl.joint_motion import check_target
 from unitree_openpi.scripts._motion import motion_parser, motion_session
 
 
-def run_reset(backend, kin, config, duration, hold, limits):
+def move_to_reset(backend, kin, config, duration, limits):
+    """Move an already acquired backend to zero and wait for measured arrival."""
     dt = 1.0 / config["motion"]["command_hz"]
     def send(q):
         state = backend.read()
@@ -26,7 +27,6 @@ def run_reset(backend, kin, config, duration, hold, limits):
     goal = check_target(np.zeros(14), limits)
     # Cubic interpolation has peak speed 1.5 * displacement / duration.
     duration = max(duration, 1.5 * np.max(np.abs(goal-center)) / config["motion"]["max_speed_rad_s"])
-    backend.acquire(state["grip_q2"], state["waist_q3"], kin.gravity(center))
     start = time.monotonic()
     while True:
         elapsed = min(time.monotonic() - start, duration)
@@ -44,10 +44,21 @@ def run_reset(backend, kin, config, duration, hold, limits):
         if time.monotonic() >= deadline:
             raise TimeoutError("arms did not reach the final joint target")
         time.sleep(dt)
+    return goal
+
+
+def run_reset(backend, kin, config, duration, hold, limits):
+    state = backend.read()
+    kin.update_state(state)
+    center = check_target(state["q14"], limits)
+    backend.acquire(state["grip_q2"], state["waist_q3"], kin.gravity(center))
+    goal = move_to_reset(backend, kin, config, duration, limits)
     print("Motion complete; holding target. Ctrl+C releases DDS." if hold else "Motion complete; releasing DDS.", flush=True)
     while hold:
-        send(goal)
-        time.sleep(dt)
+        state = backend.read()
+        kin.update_state(state)
+        backend.command(goal, kin.gravity(state["q14"]))
+        time.sleep(1.0 / config["motion"]["command_hz"])
 
 
 def main():

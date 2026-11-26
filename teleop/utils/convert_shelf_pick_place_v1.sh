@@ -3,7 +3,7 @@ set -euo pipefail
 base=/home/unitree/g1d_dataset
 name=lerobot_shelf_pick_place_v1
 [[ ! -e "$base/$name" ]] || { echo "Output already exists"; exit 1; }
-tools=/home/unitree/backups/g1d-teleop-20261116-201130/unitree_lerobot
+tools=/home/unitree/zhoumy/xr_teleoperate/unitree_lerobot
 export PATH="/home/unitree/miniconda3/envs/unitree_lerobot/bin:$PATH"
 export PYTHONPATH="$tools:$tools/unitree_lerobot/lerobot/src"
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1

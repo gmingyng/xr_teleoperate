@@ -1,5 +1,5 @@
 left:
-  type: DexPilot # or vector
+  type: vector # vector or DexPilot
   urdf_path: brainco_hand/brainco_left.urdf
 
   # Target refers to the retargeting target, which is the robot hand
@@ -31,7 +31,7 @@ left:
   low_pass_alpha: 0.2
 
 right:
-  type: DexPilot # or vector
+  type: vector # vector or DexPilot
   urdf_path: brainco_hand/brainco_right.urdf
 
   # Target refers to the retargeting target, which is the robot hand

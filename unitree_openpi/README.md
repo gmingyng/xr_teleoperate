@@ -2,6 +2,46 @@
 
 机器人客户端通过 DDS 读取双臂反馈，通过 ZMQ 接收相机画面，再通过 WebSocket 向云端策略请求动作。设备与协议配置见 [g1d.json](config/g1d.json)，代码来源见 [第三方声明](THIRD_PARTY_NOTICES.md)。
 
+
+## G1-D 遥操作数采（PICO 手柄 + 内置 Dex1）
+
+在机器人终端运行。使用此前采集货架数据的部署目录；其中的采集入口支持手柄控制和录制。先结束正在控制双臂的推理或 reset 保持程序，再启动遥操作。
+
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate tv
+cd /home/unitree/zhoumy/xr_teleoperate/teleop
+
+# 按本批演示修改目录名和任务文本。下面以罐头扫码为例。
+TASK_NAME="scan_demo_v1"
+TASK_GOAL="pick milk, scan, then place"
+
+PYTHONPATH=.. python teleop_hand_and_arm.py \
+  --input-mode controller --control-source controller --display-mode pass-through \
+  --arm G1_29 --ee dex1_internal --base-type legs \
+  --network-interface eth0 --img-server-ip 192.168.123.164 --xr-deadman-s 0.3 \
+  --record --barcode-scanner --frequency 30 --arm-reset-speed 1.5 \
+  --task-dir "$HOME/g1d_dataset" --task-name "$TASK_NAME" \
+  --task-goal "$TASK_GOAL" --task-desc "Fixed-base G1-D can scanning with internal Dex1 grippers." \
+  --task-steps "Grasp the bottle, lift it, present and rotate it, then hold after a scan, then place it." \
+  --headless
+
+python3 -u /home/unitree/thor_barcode.py --device /dev/input/event6
+```
+
+启用录制且 XR 输入有效时，可以先按 **B+Y** 开始录制，再接管手臂。单臂接管和回零期间会持续记录同一条轨迹。单击并松开 **Y/B** 分别接管左/右臂，单击并松开 **X/A** 分别让左/右臂回到关节零位并保持。组合按键需有按住时间重叠：**B+Y** 开始或保存录制；录制期间 **A+X** 丢弃并暂停，未录制时退出。暂停后可用 **Y** 或 **B** 重新接管。原始轨迹保存在 `~/g1d_dataset/<TASK_NAME>/episode_*/`，任务描述和状态动作记录在各轨迹的 `data.json` 中。
+
+THOR USB 扫码数采：在上方的数采命令增加 `--barcode-scanner`。在 THOR 执行 `python3 thor_barcode.py`，脚本源在机器人 `~/zhoumy/xr_teleoperate/unitree_openpi/scripts/thor_barcode.py`。默认读取 /dev/input/event6，发送到 192.168.123.164:48166。每条轨迹第一次扫码显示 accepted，重复显示 already_scanned，录制外显示 outside_episode。每帧 _unitree.scan_trigger 是单帧事件，scan_success 从该帧保持到结束。顶层 _unitree.scan_event 保存条码和机器人接收时间。扫码不切换手臂或录制状态。
+
+扫码任务可在机器人的第二个终端启动声光提示。扫码脚本独立运行，成功事件目前只打印到终端；录制的轨迹不会自动包含 `scan_success` 标签。
+
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate tv
+cd ~/zhoumy/xr_teleoperate
+python unitree_openpi/scripts/test_scan.py
+```
+
 ## 运行
 
 在仓库根目录执行。真机使用 Linux、Python 3.10–3.12 和 Unitree SDK2；EEF 逆解需要带 `pinocchio.casadi` 绑定的 Pinocchio 和 CasADi/IPOPT。先启动机器人的三路相机发布服务。
@@ -59,4 +99,4 @@ PYTHONPATH=src python -m hardware.camera_web \
   --web-host 127.0.0.1 --web-port 8081
 ```
 
-笔记本执行 `ssh -N -L 8081:127.0.0.1:8081 unitree@ROBOT_IP`，浏览器打开 `http://127.0.0.1:8081`。
+笔记本执行 `ssh -N -L 8081:127.0.0.1:8081 unitree@192.168.66.47`，浏览器打开 `http://127.0.0.1:8081`。

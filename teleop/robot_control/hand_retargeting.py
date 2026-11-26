@@ -1,3 +1,12 @@
+import os
+import sys
+# Prefer the dex_retargeting bundled in this repo (under robot_control/dex-retargeting/src)
+# over any version installed in site-packages. The path is resolved relative to this file,
+# so it stays correct after an OTA update moves the whole tree, and needs no `pip install -e`.
+_LOCAL_DEX_RETARGETING_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dex-retargeting", "src")
+if os.path.isdir(_LOCAL_DEX_RETARGETING_SRC) and _LOCAL_DEX_RETARGETING_SRC not in sys.path:
+    sys.path.insert(0, _LOCAL_DEX_RETARGETING_SRC)
+
 from dex_retargeting import RetargetingConfig
 from pathlib import Path
 import yaml

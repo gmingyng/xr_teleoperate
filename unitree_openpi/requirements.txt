@@ -10,3 +10,5 @@ websockets>=14,<17
 msgpack>=1.0,<2
 # DDS hardware only (the mock runtime does not import this SDK):
 unitree_sdk2py @ git+https://github.com/unitreerobotics/unitree_sdk2_python.git@65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5
+
+zxing-cpp>=3.1.1,<4

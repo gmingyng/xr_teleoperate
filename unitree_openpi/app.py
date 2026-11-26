@@ -34,14 +34,14 @@ def observation(controller, cameras, config, sequence, prompt):
         "joint_positions": state["q14"].tolist(), "joint_velocities": state["dq14"].tolist(),
         "waist_q3": state["waist_q3"].tolist(), "grip_q2": state["grip_q2"].tolist(),
         "state_age_s": now - state_received,
-        "cameras": {name: {key: value for key, value in frame.items() if key != "image"}
+        "cameras": {name: {key: value for key, value in frame.items() if key not in ("image", "review_right_eye")}
                     for name, frame in frames.items()},
         "last_action": controller.last_action,
     }
     return result, earliest
 
 
-def execute_policy(controller, response, sequence, expires, stop):
+def execute_policy(controller, response, sequence, expires, stop, *, recorder=None):
     config = controller.config
     settings = config["policy"]
     if settings.get("action_space") == "joint":
@@ -50,18 +50,25 @@ def execute_policy(controller, response, sequence, expires, stop):
                 not 1 <= len(actions) <= settings["max_chunk_steps"] or not np.isfinite(actions).all()):
             raise ValueError("expected a finite (T,16) absolute joint action chunk")
         if not controller.execute:
+            if recorder is not None:
+                recorder.target = actions[0].copy()
             print(f"Cloud actions [{sequence}] shape={actions.shape} first={actions[0]}", flush=True)
             controller.last_action = {"status": "observing", "executed": False}
             return
-        for i, row in enumerate(actions[:settings["execute_steps"]]):
+        period = 1.0 / settings.get("target_hz", 50.0)
+        chunk = actions[:settings["execute_steps"]]
+        for i, row in enumerate(chunk):
             if stop.is_set():
                 break
-            deadline = min(expires, time.monotonic() + config["motion"]["action_timeout_s"])
+            started = time.monotonic()
+            deadline = min(expires, started + config["motion"]["action_timeout_s"])
             status = controller.apply(None, deadline, joint_positions=np.r_[row[:7], row[8:15]],
-                                      gripper_positions=row[[7, 15]])
+                                      gripper_positions=row[[7, 15]], wait_for_arrival=False)
+            if recorder is not None:
+                recorder.target = row.copy()
             controller.last_action = dict(status, observation_id=sequence, step=i)
-            if i + 1 < min(len(actions), settings["execute_steps"]):
-                stop.wait(1 / config["motion"]["command_hz"])
+            if i + 1 < len(chunk):
+                stop.wait(max(0.0, min(started + period, expires) - time.monotonic()))
         return
     eef, joints = parse_policy_chunk(response, settings)
     if eef is not None:
@@ -80,51 +87,123 @@ def execute_policy(controller, response, sequence, expires, stop):
             stop.wait(1.0 / config["motion"]["command_hz"])
 
 
-def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, handle_response=execute_policy):
+def _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, handle_response, scanner=None):
+    sequence, completed = 0, 0
+    while not stop.is_set() and (not max_steps or completed < max_steps):
+        started = time.monotonic()
+        try:
+            if client.connection is None:
+                metadata = client.connect()
+                if config["policy"].get("action_space") == "joint":
+                    spec = metadata.get("g1d", {})
+                    if any(spec.get(key) != value for key, value in {
+                        "action_space": "joint", "action_representation": "absolute", "state_dim": 17 if scanner else 16,
+                        "action_dim": 16, "gripper_units": "motor_position",
+                    }.items()):
+                        raise ValueError("server does not advertise the absolute G1-D joint protocol")
+                log.info("Connected to policy (%s)", metadata)
+            sequence += 1
+            obs, observed = observation(controller, cameras, config, sequence, prompt)
+            flag = False
+            if scanner:
+                flag = scanner.frame(time.monotonic_ns())["scan_success"]
+                obs["_unitree"]["scan_success"] = flag
+                key = config["policy"]["state_key"]
+                obs[key] = np.concatenate(([np.float32(flag)], obs[key]))
+            sent = time.monotonic()
+            response = client.infer(obs)
+            log.info("Observation %d inference round trip %.1f ms", sequence, 1000 * (time.monotonic() - sent))
+            settings = config["policy"]
+            if response.get("observation_id", sequence) != sequence:
+                raise ValueError("action observation_id does not match request")
+            expires = observed + settings["max_observation_age_s"]
+            if time.monotonic() >= expires and (controller.execute or settings.get("action_space") != "joint"):
+                raise TimeoutError("policy response is older than max_observation_age_s")
+            action_stop = stop
+            if scanner and not flag:
+                # A scan during inference or execution invalidates the old phase.
+                class UntilScan:
+                    def is_set(self):
+                        return stop.is_set() or scanner.frame(time.monotonic_ns())["scan_success"]
+
+                    def wait(self, timeout):
+                        return stop.wait(timeout)
+                action_stop = UntilScan()
+                if action_stop.is_set():
+                    continue
+            handle_response(controller, response, sequence, expires, action_stop)
+            completed += 1
+            log.info("Observation %d: %s", sequence, controller.last_action["status"])
+        except Exception as exc:
+            controller.freeze()
+            controller.last_action = {"status": "error", "observation_id": sequence,
+                                      "message": str(exc)}
+            log.warning("Holding; inference/action failed: %s", exc)
+            client.close()  # Discard delayed replies; reconnect with a new observation.
+            if max_steps:
+                raise
+            stop.wait(config["policy"].get("reconnect_s", 1.0))
+        period = 1.0 / config["motion"]["command_hz"]
+        stop.wait(max(0, period - (time.monotonic() - started)))
+    return completed
+
+
+def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, handle_response=execute_policy, reset_first=False, record_dir=None):
     stop = threading.Event() if stop is None else stop
     client = PolicyClient(config["policy"])
-    sequence, completed = 0, 0
+    completed = 0
+
+    def infer(scanner):
+        if record_dir is None:
+            return _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, handle_response, scanner)
+        from functools import partial
+        from .utils.review_video import ReviewVideo
+        with ReviewVideo(record_dir, cameras, controller, prompt) as recorder:
+            handler = partial(handle_response, recorder=recorder)
+            try:
+                return _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, handler, scanner)
+            except KeyboardInterrupt:
+                controller.freeze()
+                raise
+
+    def session():
+        if not config["policy"].get("barcode_scanner"):
+            return infer(None)
+        from teleop.utils.recording_schema import BarcodeReceiver
+        scanner = BarcodeReceiver()
+        try:
+            scanner.begin(time.monotonic_ns())
+            return infer(scanner)
+        finally:
+            scanner.close()
+
     try:
         controller.connect()
-        cameras.start()
-        while not stop.is_set() and (not max_steps or completed < max_steps):
-            started = time.monotonic()
+        if not reset_first:
+            cameras.start()
+            return session()
+
+        from .robot_ctrl.joint_motion import joint_limits
+        from .scripts.reset_dual_arms import move_to_reset
+
+        limits = joint_limits(config)
+        cameras_started = False
+        while not stop.is_set():
+            move_to_reset(controller.backend, controller.kin, config, 5.0, limits)
             try:
-                if client.connection is None:
-                    metadata = client.connect()
-                    if config["policy"].get("action_space") == "joint":
-                        spec = metadata.get("g1d", {})
-                        if any(spec.get(key) != value for key, value in {
-                            "action_space": "joint", "action_representation": "absolute", "state_dim": 16,
-                            "action_dim": 16, "gripper_units": "motor_position",
-                        }.items()):
-                            raise ValueError("server does not advertise the absolute G1-D joint protocol")
-                    log.info("Connected to policy (%s)", metadata)
-                sequence += 1
-                obs, observed = observation(controller, cameras, config, sequence, prompt)
-                sent = time.monotonic()
-                response = client.infer(obs)
-                log.info("Observation %d inference round trip %.1f ms", sequence, 1000 * (time.monotonic() - sent))
-                settings = config["policy"]
-                if response.get("observation_id", sequence) != sequence:
-                    raise ValueError("action observation_id does not match request")
-                expires = observed + settings["max_observation_age_s"]
-                if time.monotonic() >= expires and (controller.execute or settings.get("action_space") != "joint"):
-                    raise TimeoutError("policy response is older than max_observation_age_s")
-                handle_response(controller, response, sequence, expires, stop)
-                completed += 1
-                log.info("Observation %d: %s", sequence, controller.last_action["status"])
-            except Exception as exc:
-                controller.freeze()
-                controller.last_action = {"status": "error", "observation_id": sequence,
-                                          "message": str(exc)}
-                log.warning("Holding; inference/action failed: %s", exc)
-                client.close()  # Discard delayed replies; reconnect with a new observation.
-                if max_steps:
-                    raise
-                stop.wait(config["policy"].get("reconnect_s", 1.0))
-            period = 1.0 / config["motion"]["command_hz"]
-            stop.wait(max(0, period - (time.monotonic() - started)))
+                input("Holding reset. Enter starts inference; Ctrl+C exits. ")
+            except EOFError:
+                break
+            if not cameras_started:
+                cameras.start()
+                cameras_started = True
+            try:
+                log.info("Inference active. Ctrl+C cancels the chunk and returns arms to reset.")
+                completed += session()
+            except KeyboardInterrupt:
+                log.info("Inference cancelled; returning to reset.")
+            controller.freeze()
+            client.close()
     finally:
         # Each resource is released even when another close operation fails.
         try:

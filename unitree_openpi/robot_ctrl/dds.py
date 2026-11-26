@@ -396,14 +396,18 @@ class G1DDSBackend:
             "gripper": (state["grip_q2"], self._last_sent_grip, self.motion["grip_tolerance"]),
         }
         if self._last_sent_q is not None and not self._arm_zero_torque:
-            checks["arm"] = (state["q14"], self._last_sent_q, self.motion["tracking_tolerance_rad"])
+            tol = self.motion.get("arm_tracking_tolerance_rad", self.motion["tracking_tolerance_rad"])
+            checks["arm"] = (state["q14"], self._last_sent_q, tol)
         if self._waist_target is not None:
             checks["waist"] = (state["waist_q3"], self._waist_target, self.motion["waist_tolerance_rad"])
         for name, (actual, target, tolerance) in checks.items():
             error = float(np.max(np.abs(actual - target)))
             if error > float(tolerance):
                 since = self._tracking_since.setdefault(name, now)
-                if now - since >= float(self.motion["tracking_window_s"]):
+                window = self.motion["tracking_window_s"]
+                if name == "arm":
+                    window = self.motion.get("arm_tracking_window_s", window)
+                if now - since >= float(window):
                     raise RuntimeError(f"{name} tracking error {error:.6f} exceeds {tolerance}")
             else:
                 self._tracking_since.pop(name, None)

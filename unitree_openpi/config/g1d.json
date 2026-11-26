@@ -12,10 +12,11 @@
     "gripper_kp": [5,5], "gripper_kd": [0.05,0.05]
   },
   "motion": {
-    "publish_hz": 250, "command_hz": 20,
-    "max_speed_rad_s": 0.5,
-    "max_translation_m": 0.03, "max_rotation_rad": 0.15,
-    "max_joint_step_rad": 0.3, "action_timeout_s": 1.0
+    "publish_hz": 250, "command_hz": 50,
+    "max_speed_rad_s": 1.5,
+    "arm_tracking_tolerance_rad": 0.4, "arm_tracking_window_s": 1.0,
+    "max_translation_m": 0.1, "max_rotation_rad": 0.5,
+    "max_joint_step_rad": 1.0, "action_timeout_s": 0.5
   },
   "model": {
     "urdf": "../assets/g1d/g1_d.urdf",
@@ -43,9 +44,10 @@
     "url": "ws://127.0.0.1:8000", "protocol": "openpi",
     "api_key_env": "OPENPI_API_KEY", "timeout_s": 5.0, "reconnect_s": 1.0,
     "state_key": "observation/state", "prompt_key": "prompt", "image_container_key": null,
-    "image_keys": {"head":"observation/images/high", "left_wrist":"observation/images/left_wrist", "right_wrist":"observation/images/right_wrist"},
-    "include_grippers": true,
+    "image_keys": {"head": "observation/images/high", "left_wrist": "observation/images/right_wrist", "right_wrist": "observation/images/left_wrist"},
+    "action_frame": "base", "include_grippers": true,
     "open_q2": [2.3,2.3], "closed_q2": [0,0],
+    "gripper_command_limits": [[0, 0], [5.4, 5.4]],
     "max_observation_age_s": 2.0, "execute_steps": 1, "max_chunk_steps": 64
   }
 }

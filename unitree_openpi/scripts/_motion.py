@@ -38,6 +38,7 @@ def motion_session(args):
             yield backend, kin, config, limits
         except KeyboardInterrupt:
             print("Interrupted; releasing DDS. No powered hold after exit.", flush=True)
+            raise SystemExit(130)
         finally:
             backend.hold()
             backend.close()

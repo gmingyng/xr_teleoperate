@@ -90,7 +90,7 @@ class EEFController:
             if np.any(np.linalg.norm(actions[:, start+3:start+6], axis=1) > motion["max_rotation_rad"]):
                 raise ValueError("relative rotation exceeds max_rotation_rad")
 
-    def apply(self, action, expires_at, joint_positions=None, *, gripper_positions=None):
+    def apply(self, action, expires_at, joint_positions=None, *, gripper_positions=None, wait_for_arrival=True):
         settings, motion = self.config["policy"], self.config["motion"]
         width, stride = (14, 7) if settings["include_grippers"] else (12, 6)
         if action is not None:
@@ -138,10 +138,8 @@ class EEFController:
         grip = None
         if gripper_positions is not None:
             grip = vector(gripper_positions, 2, "absolute gripper positions")
-            lo = np.minimum(settings["closed_q2"], settings["open_q2"])
-            hi = np.maximum(settings["closed_q2"], settings["open_q2"])
-            if np.any((grip < lo) | (grip > hi)):
-                raise ValueError("absolute gripper target outside configured motor endpoints")
+            lo, hi = np.asarray(settings["gripper_command_limits"], dtype=float)
+            grip = np.clip(grip, lo, hi)
         if action is not None and settings["include_grippers"]:
             normalized = action[[6, 13]]
             if np.any((normalized < 0) | (normalized > 1)):
@@ -150,7 +148,11 @@ class EEFController:
                 np.array(settings["open_q2"]) - settings["closed_q2"])
         if not self.execute:
             return {"status": "observing", "executed": False}
+        if time.monotonic() >= expires_at:
+            raise TimeoutError("action expired before dispatch")
         self.backend.command(q, tau, grip)
+        if not wait_for_arrival:
+            return {"status": "target_sent", "executed": True}
         deadline = min(expires_at, time.monotonic() + motion["settle_timeout_s"])
         while True:
             measured = self.backend.read()
