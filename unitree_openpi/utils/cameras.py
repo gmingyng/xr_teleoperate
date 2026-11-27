@@ -31,8 +31,9 @@ def prepare_rgb(bgr, name, settings):
 
 
 class CameraCapture:
-    def __init__(self, settings):
+    def __init__(self, settings, *, head_views=()):
         self.settings = settings
+        self.head_views = {view: dict(settings, head_view=view) for view in head_views}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._frames, self._errors = {}, {}
@@ -83,8 +84,11 @@ class CameraCapture:
                             raise ValueError("invalid JPEG")
                         rgb = prepare_rgb(bgr, name, self.settings)
                         extra = {}
-                        if name == "head" and self.settings.get("record_right_eye"):
-                            extra["review_right_eye"] = prepare_rgb(bgr, name, dict(self.settings, head_view="right"))
+                        if name == "head" and self.head_views:
+                            extra["head_views"] = {
+                                view: prepare_rgb(bgr, name, settings)
+                                for view, settings in self.head_views.items()
+                            }
                         with self._lock:
                             previous = self._frames.get(name)
                             seq = 1 if previous is None else previous["sequence"] + 1
@@ -123,8 +127,9 @@ class CameraCapture:
 
 
 class MockCameras:
-    def __init__(self, settings):
+    def __init__(self, settings, *, head_views=()):
         self.settings, self.sequence = settings, 0
+        self.head_views = tuple(head_views)
 
     def start(self):
         pass
@@ -139,6 +144,8 @@ class MockCameras:
             rgb[:, :, index] = (self.sequence % 128) + 64
             frames[name] = dict(image=rgb, sequence=self.sequence,
                                received_monotonic_s=now, received_at=wall)
+            if name == "head" and self.head_views:
+                frames[name]["head_views"] = {view: rgb.copy() for view in self.head_views}
         return frames
 
     def close(self):

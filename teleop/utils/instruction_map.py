@@ -1,26 +1,5 @@
 import numpy as np
 
-class HandleInstruction:
-    def __init__(self, r3_controller, tv_wrapper, mobile_ctrl):
-        self.r3_controller = r3_controller
-        self.tv_wrapper = tv_wrapper
-        self.mobile_ctrl = mobile_ctrl
-    def get_instruction(self):
-        if self.r3_controller and self.mobile_ctrl is not None:
-            lx = self.mobile_ctrl.r3_controller_state_array_out[0]
-            ly = -self.mobile_ctrl.r3_controller_state_array_out[1]
-            rx = -self.mobile_ctrl.r3_controller_state_array_out[2]
-            ry = -self.mobile_ctrl.r3_controller_state_array_out[3]
-            rbutton_A = True if int(self.mobile_ctrl.r3_controller_state_array_out[4]) == 256 else False
-            rbutton_B = True if int(self.mobile_ctrl.r3_controller_state_array_out[4]) == 512 else False
-        else:
-            lx = -self.tv_wrapper.get_tele_data().left_ctrl_thumbstickValue[1]
-            ly = -self.tv_wrapper.get_tele_data().left_ctrl_thumbstickValue[0]
-            rx = -self.tv_wrapper.get_tele_data().right_ctrl_thumbstickValue[0]
-            ry = -self.tv_wrapper.get_tele_data().right_ctrl_thumbstickValue[1]
-            rbutton_A = self.tv_wrapper.get_tele_data().right_ctrl_aButton
-            rbutton_B = self.tv_wrapper.get_tele_data().right_ctrl_bButton
-        return {'lx': lx, 'ly': ly, 'rx': rx, 'ry': ry, 'rbutton_A': rbutton_A, 'rbutton_B': rbutton_B}
 
 class LowPassFilter:
     """Low-pass filter for smoothing data"""

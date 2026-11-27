@@ -9,6 +9,8 @@ import time
 import cv2
 import numpy as np
 
+from ..policy_protocol import joint_state_vector
+
 
 FPS = 30
 WINDOW = 10
@@ -76,8 +78,8 @@ class ReviewVideo:
         mapping = self.controller.config["policy"]["image_keys"]
         for name, frame in frames.items():
             views[mapping[name].split("/")[-1]] = frame["image"]
-            if "review_right_eye" in frame:
-                views["right_eye"] = frame["review_right_eye"]
+            if "right" in frame.get("head_views", {}):
+                views["right_eye"] = frame["head_views"]["right"]
         for i, (key, title) in enumerate(zip(("high", "right_eye", "left_wrist", "right_wrist"),
                                               ("HEAD LEFT", "HEAD RIGHT", "WRIST LEFT", "WRIST RIGHT"))):
             x = i * 320
@@ -88,8 +90,7 @@ class ReviewVideo:
             else:
                 label(canvas, "Unavailable", x+100, 170)
         try:
-            s = self.controller.backend.read()
-            state = np.r_[s["q14"][:7], s["grip_q2"][0], s["q14"][7:], s["grip_q2"][1]]
+            state = joint_state_vector(self.controller.backend.read())
         except RuntimeError:
             state = np.full(16, np.nan)
         self.history.append((elapsed, np.stack((state, self.target))))

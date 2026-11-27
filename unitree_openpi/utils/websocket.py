@@ -5,6 +5,9 @@ import os
 from .wire import packb, unpackb, json_encode, json_decode
 
 
+_DEFAULT_TIMEOUT = object()
+
+
 class PolicyClient:
     def __init__(self, settings):
         self.settings = settings
@@ -36,12 +39,15 @@ class PolicyClient:
             return unpackb(payload)
         return json_decode(payload)
 
-    def infer(self, observation):
+    def infer(self, observation, *, timeout_s=_DEFAULT_TIMEOUT):
+        """Request a prediction using the configured timeout unless explicitly overridden."""
         if self.connection is None:
             raise RuntimeError("policy is not connected")
         encode = packb if self.settings["protocol"] == "openpi" else json_encode
         self.connection.send(encode(observation))
-        response = self._decode(self.connection.recv(timeout=self.settings["timeout_s"]))
+        if timeout_s is _DEFAULT_TIMEOUT:
+            timeout_s = self.settings["timeout_s"]
+        response = self._decode(self.connection.recv(timeout=timeout_s))
         if not isinstance(response, dict):
             raise ValueError("policy response must be an object")
         return response

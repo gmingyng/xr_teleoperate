@@ -11,9 +11,10 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 from websockets.sync.server import serve
 
-from unitree_openpi.app import observation, run
+from unitree_openpi.scripts._inference import observation, run
 from unitree_openpi.mock_policy_server import make_handler
-from unitree_openpi.robot_ctrl.controller import JointController, parse_actions
+from unitree_openpi.policy_protocol import parse_actions, parse_joint_actions
+from unitree_openpi.robot_ctrl.controller import EEFController
 from unitree_openpi.robot_ctrl.dds import G1DDSBackend
 from unitree_openpi.robot_ctrl.mock import MockBackend, MockKinematics
 from unitree_openpi.utils.cameras import CameraCapture, MockCameras, prepare_rgb
@@ -25,13 +26,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def config():
-    return load_config(ROOT / "config/g1d.json")
+    settings = load_config(ROOT / "config/g1d.json")
+    settings["policy"]["action_space"] = "joint"
+    return settings
+
+
+def apply_joint(ctrl, row, deadline):
+    return ctrl.apply(None, deadline, joint_positions=np.r_[row[:7], row[8:15]],
+                      gripper_positions=row[[7, 15]])
 
 
 def controller(settings=None, execute=True):
     settings = config() if settings is None else settings
     backend = MockBackend(settings)
-    ctrl = JointController(settings, backend, MockKinematics(), execute=execute)
+    ctrl = EEFController(settings, backend, MockKinematics(), execute=execute)
     ctrl.connect()
     return ctrl, backend
 
@@ -55,7 +63,7 @@ class RelativeActions(unittest.TestCase):
             before = ctrl.kin.fk(backend.q)
             action = np.zeros(16)
             action[0] = .01
-            result = ctrl.apply(action, time.monotonic() + 1)
+            result = apply_joint(ctrl, action, time.monotonic() + 1)
             after = ctrl.kin.fk(backend.q)
             self.assertEqual(result["status"], "reached")
             np.testing.assert_allclose(after["left"][:3, 3] - before["left"][:3, 3], [-.01, 0, 0])
@@ -66,14 +74,14 @@ class RelativeActions(unittest.TestCase):
     def test_invalid_stale_and_outside_workspace_do_not_publish(self):
         ctrl, backend = controller()
         try:
-            for action in (np.full(14, np.nan), np.r_[.5, np.zeros(13)]):
+            for action in (np.full(16, np.nan), np.r_[2.0, np.zeros(15)]):
                 with self.assertRaises(ValueError):
-                    ctrl.apply(action, time.monotonic() + 1)
+                    apply_joint(ctrl, action, time.monotonic() + 1)
             with self.assertRaises(TimeoutError):
-                ctrl.apply(np.zeros(16), time.monotonic() - 1)
+                apply_joint(ctrl, np.zeros(16), time.monotonic() - 1)
             ctrl.config["model"]["workspace"]["left"][1][0] = .1
             with self.assertRaises(ValueError):
-                ctrl.apply(np.zeros(16), time.monotonic() + 1)
+                apply_joint(ctrl, np.zeros(16), time.monotonic() + 1)
             self.assertFalse(backend.commands)
         finally:
             ctrl.close()
@@ -87,18 +95,20 @@ class RelativeActions(unittest.TestCase):
         ctrl.kin.gravity = slow
         try:
             with self.assertRaises(TimeoutError):
-                ctrl.apply(np.zeros(16), time.monotonic() + .01)
+                apply_joint(ctrl, np.zeros(16), time.monotonic() + .01)
             self.assertFalse(backend.commands)
         finally:
             ctrl.close()
 
     def test_joint_jump_is_rejected(self):
-        ctrl, backend = controller()
+        settings = config()
+        settings["motion"]["max_joint_step_rad"] = 0.3
+        ctrl, backend = controller(settings)
         jump = np.zeros(16)
         jump[3] = 1
         try:
             with self.assertRaisesRegex(ValueError, "joint step"):
-                ctrl.apply(jump, time.monotonic() + 1)
+                apply_joint(ctrl, jump, time.monotonic() + 1)
             self.assertFalse(backend.commands)
         finally:
             ctrl.close()
@@ -106,7 +116,7 @@ class RelativeActions(unittest.TestCase):
     def test_observation_mode_never_acquires_or_commands(self):
         ctrl, backend = controller(execute=False)
         try:
-            result = ctrl.apply(np.zeros(16), time.monotonic() + 1)
+            result = apply_joint(ctrl, np.zeros(16), time.monotonic() + 1)
             self.assertEqual(result["status"], "observing")
             self.assertFalse(backend.acquired)
             self.assertFalse(backend.commands)
@@ -120,29 +130,28 @@ class RelativeActions(unittest.TestCase):
         try:
             action = np.zeros(16)
             action[[7, 15]] = [.5, -1.5]
-            ctrl.apply(action, time.monotonic() + 1)
+            apply_joint(ctrl, action, time.monotonic() + 1)
             np.testing.assert_allclose(backend.grip, [.5, -1.5])
             obs, _ = observation(ctrl, MockCameras(settings["cameras"]), settings, 1, "test")
             np.testing.assert_allclose(obs["observation/state"][[7, 15]], [.5, -1.5])
             bad = action.copy()
-            bad[7] = 2.1
+            bad[7] = np.nan
             with self.assertRaises(ValueError):
-                parse_actions({"actions": [bad]}, settings["policy"])
+                parse_joint_actions({"actions": [bad]})
         finally:
             ctrl.close()
 
-    def test_dex1_accepts_dataset_feedback_and_float32_upper_bound(self):
+    def test_dex1_accepts_dataset_feedback_and_clips_motor_limits(self):
         ctrl, backend = controller()
         try:
             action = np.zeros(16, dtype=np.float32)
             action[[7, 15]] = [5.26, 5.4]
-            ctrl.apply(action, time.monotonic() + 1)
+            apply_joint(ctrl, action, time.monotonic() + 1)
             np.testing.assert_array_equal(backend.grip, [float(action[7]), 5.4])
-            for invalid in (-.001, 5.401):
-                action[7] = invalid
-                with self.assertRaises(ValueError):
-                    ctrl.apply(action, time.monotonic() + 1)
-            self.assertEqual(len(backend.commands), 1)
+            action[[7, 15]] = [-.001, 5.401]
+            apply_joint(ctrl, action, time.monotonic() + 1)
+            np.testing.assert_array_equal(backend.grip, [0.0, 5.4])
+            self.assertEqual(len(backend.commands), 2)
         finally:
             ctrl.close()
 
@@ -179,8 +188,10 @@ class WireProtocol(unittest.TestCase):
             backend.q[0] = .05
             backend.q[3:6] = [.2, -.3, .4]
             settings = config()
-            ctrl.last_action = {"status": "reached", "observation_id": 1}
-            obs, created = observation(ctrl, MockCameras(settings["cameras"]), settings, 2, "pick")
+            last_action = {"status": "reached", "observation_id": 1}
+            obs, created = observation(
+                ctrl, MockCameras(settings["cameras"]), settings, 2, "pick", last_action=last_action,
+            )
             self.assertAlmostEqual(float(obs["observation/state"][0]), .05)
             self.assertEqual(obs["observation/state"].shape, (16,))
             np.testing.assert_allclose(obs["observation/state"][3:6], [.2, -.3, .4], atol=1e-6)
@@ -288,6 +299,9 @@ class DDSChecks(unittest.TestCase):
 
 
 class EndToEnd(unittest.TestCase):
+    JOINT_METADATA = {"g1d": {"action_space": "joint", "action_representation": "absolute",
+                              "state_dim": 16, "action_dim": 16, "gripper_units": "motor_position"}}
+
     @unittest.skipUnless(importlib.util.find_spec("cv2"), "OpenCV unavailable")
     def test_json_socket_transmits_three_images_and_executes(self):
         settings = config()
@@ -297,7 +311,7 @@ class EndToEnd(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             backend = MockBackend(settings)
-            ctrl = JointController(settings, backend, MockKinematics(), execute=True)
+            ctrl = EEFController(settings, backend, MockKinematics(), execute=True)
             try:
                 self.assertEqual(run(settings, ctrl, MockCameras(settings["cameras"]), max_steps=2), 2)
             finally:
@@ -309,7 +323,7 @@ class EndToEnd(unittest.TestCase):
     def test_absolute_joint_socket_rejects_legacy_eef(self):
         settings = config()
         def policy(connection):
-            connection.send(packb({}))
+            connection.send(packb(self.JOINT_METADATA))
             for index in range(3):
                 obs = unpackb(connection.recv())
                 joints = obs["observation/state"].copy()
@@ -317,13 +331,13 @@ class EndToEnd(unittest.TestCase):
                 actions = joints[None] if index < 2 else {"eef": joints[None]}
                 connection.send(packb({"actions": actions}))
         backend = MockBackend(settings)
-        ctrl = JointController(settings, backend, MockKinematics(), execute=True)
+        ctrl = EEFController(settings, backend, MockKinematics(), execute=True)
         with serve(policy, "127.0.0.1", 0) as server:
             settings["policy"]["url"] = f"ws://127.0.0.1:{server.socket.getsockname()[1]}"
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
-                with self.assertRaisesRegex(ValueError, "absolute joint array"):
+                with self.assertRaisesRegex(ValueError, "absolute joint action chunk"):
                     run(settings, ctrl, MockCameras(settings["cameras"]), max_steps=3)
             finally:
                 server.shutdown()
@@ -350,7 +364,7 @@ class EndToEnd(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             backend = MockBackend(settings)
-            ctrl = JointController(settings, backend, MockKinematics(), execute=True)
+            ctrl = EEFController(settings, backend, MockKinematics(), execute=True)
             try:
                 self.assertEqual(run(settings, ctrl, MockCameras(settings["cameras"]), max_steps=3), 3)
             finally:
@@ -359,14 +373,14 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(len(received), 3)
         self.assertEqual(len(backend.commands), 3)
         self.assertAlmostEqual(backend.q[0], .003, places=7)
-        self.assertEqual(received[1]["_unitree"]["last_action"]["status"], "reached")
+        self.assertEqual(received[1]["_unitree"]["last_action"]["status"], "target_sent")
         self.assertEqual(received[0]["observation/images/right_wrist"].shape, (224, 224, 3))
 
     def test_late_policy_reply_never_reaches_robot(self):
         settings = config()
         settings["policy"]["max_observation_age_s"] = .02
         def delayed(connection):
-            connection.send(packb({"mock": True}))
+            connection.send(packb(self.JOINT_METADATA))
             connection.recv()
             time.sleep(.05)
             connection.send(packb({"actions": np.zeros((1, 12))}))
@@ -375,7 +389,7 @@ class EndToEnd(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             backend = MockBackend(settings)
-            ctrl = JointController(settings, backend, MockKinematics(), execute=True)
+            ctrl = EEFController(settings, backend, MockKinematics(), execute=True)
             try:
                 with self.assertRaises(TimeoutError):
                     run(settings, ctrl, MockCameras(settings["cameras"]), max_steps=1)

@@ -4,7 +4,6 @@ from unitree_sdk2py.idl.geometry_msgs.msg.dds_ import Twist_
 from unitree_sdk2py.idl.default import geometry_msgs_msg_dds__Point32_,geometry_msgs_msg_dds__Twist_
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__MotorCmd_
 from unitree_sdk2py.idl.nav_msgs.msg.dds_ import Odometry_
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import MotorCmd_, MotorState_
 import threading
 import time
@@ -24,19 +23,16 @@ kTopicHeightState = "rt/hispeed_state"
 kTopicG1MoveCmd = "rt/cmd_vel_no_limit"
 kTopicG1MoveState = "rt/slamware_ros_sdk_server_node/odom"
 
-kTopicR3Controller = "rt/wirelesscontroller"
-
 kTopicWaistPitchCmd = "rt/waistpitchcmd"
 kTopicWaistPitchState = "rt/waistpitchstate"
 
 class G1D_Mobile_Lift_Controller:
-    def __init__(self, base_type, r3_controller, fps = 30.0, output_enabled_in = None):
+    def __init__(self, base_type, fps = 30.0, output_enabled_in = None):
         """
         Initialize G1 mobile base and elevation controller
         
         Args:
             base_type: "only_height" for height only, "with_move" for height + movement
-            r3_controller: "true" for R3 controller, "false" for XR controller
             fps: Control frequency
         """
         logger_mp.info("Initialize G1D_Mobile_Lift_Controller...")
@@ -44,7 +40,6 @@ class G1D_Mobile_Lift_Controller:
             raise ValueError(f"fps must be positive, got {fps}")
         self.fps = fps
         self.base_type = base_type 
-        self.r3_controller = r3_controller
         self.output_enabled_in = output_enabled_in
         # Data reception flags
         self.height_data_received = False
@@ -61,8 +56,6 @@ class G1D_Mobile_Lift_Controller:
         self.g1_height_action_array_out = Array('d', 1, lock=True)  # For receiving published height action values, ready to save to dataset
         self.g1_move_state_array_out = None
         self.g1_move_action_array_out = None  # For receiving published movement action values, ready to save to dataset
-
-        self.r3_controller_state_array_out = None
 
         # Height control publisher
         self.HeightCmb_publisher = ChannelPublisher(kTopicHeightCmd, Point32_)
@@ -93,35 +86,12 @@ class G1D_Mobile_Lift_Controller:
             lambda: self.height_data_received and (self.base_type != "mobile_lift" or self.move_data_received),
             "G1D_Mobile_Lift_Controller"
         )
-        # If not using Unitree controller, start control process
-        if self.r3_controller:
-            self.r3_controller_state_array_out = Array('d', 5, lock=True)
-            self.r3_controller_state_subscriber = ChannelSubscriber(kTopicR3Controller, WirelessController_)
-            self.r3_controller_state_subscriber.Init()
-            self.subscribe_r3_controller_state_thread = threading.Thread(target=self._subscribe_r3_controller_state)
-            self.subscribe_r3_controller_state_thread.daemon = True
-            self.subscribe_r3_controller_state_thread.start()
         self.running = True
         mobile_control_process = Process(target=self.control_process, args=(self.base_type, self.output_enabled_in))
         mobile_control_process.daemon = True
         mobile_control_process.start()
 
         logger_mp.info("Initialize G1D_Mobile_Lift_Controller OK!\n")
-
-    def _subscribe_r3_controller_state(self):
-        while True:
-            try:
-                r3_controller_msg = self.r3_controller_state_subscriber.Read()
-                if r3_controller_msg is not None:
-                    self.r3_controller_state_array_out[1] = r3_controller_msg.lx
-                    self.r3_controller_state_array_out[0] = r3_controller_msg.ly
-                    self.r3_controller_state_array_out[2] = r3_controller_msg.rx
-                    self.r3_controller_state_array_out[3] = r3_controller_msg.ry
-                    self.r3_controller_state_array_out[4] = r3_controller_msg.keys
-            except Exception as e:
-                logger_mp.info(f"[_subscribe_r3_controller_state] Exception: {e}")
-                time.sleep(0.1)
-            time.sleep(0.01)
 
     def _subscribe_g1_mobilebase_state(self):
         while True:
@@ -221,7 +191,7 @@ class G1D_Mobile_Waist_Pitch_Controller:
     mode = 1                 # FOC with command-timeout protection
     min_angle = 0.0          # rad, upright
     max_angle = 2.3562       # rad, bent over
-    travel_seconds = 5.0     # s to sweep the full range while a button is held
+    travel_seconds = 5.0     # s to sweep the full range at a constant direction
     DELTA_WAIST_PITCH_CMD = 0.10  # rad, cap on how far the command may lead the measured angle
 
     def __init__(self, arm_ctrl, fps = 200.0, output_enabled_in = None):
@@ -234,8 +204,7 @@ class G1D_Mobile_Waist_Pitch_Controller:
         self.arm_ctrl = arm_ctrl
         self.output_enabled_in = output_enabled_in
         self.waist_pitch_data_received = False
-        # Holding a button sweeps the whole range in travel_seconds, so the speed follows
-        # from the limits rather than being tuned separately.
+        # Derive the velocity from the configured range and travel time.
         self.velocity = (self.max_angle - self.min_angle) / self.travel_seconds
         self.gravity_ff = G1D_WaistPitchGravityFeedforward()
 
@@ -288,15 +257,14 @@ class G1D_Mobile_Waist_Pitch_Controller:
     def get_current_waist_pitch_action(self):
         return self.g1_waist_pitch_action_value_out.value
 
-    def set_waist_pitch_buttons(self, button_bend, button_raise):
-        # Pressing both buttons, or neither, is no request.
-        direction = 0.0 if bool(button_bend) == bool(button_raise) else (1.0 if button_bend else -1.0)
+    def set_direction(self, direction):
+        if direction not in (-1.0, 0.0, 1.0):
+            raise ValueError("waist pitch direction must be -1, 0, or 1")
         self.g1_waist_pitch_action_value_in.value = direction
-        return direction
 
     def ctrl_waist_pitch_go_home(self, tolerance = 0.05, timeout = 6.0):
         logger_mp.info("[G1D_Mobile_Waist_Pitch_Controller] ctrl_waist_pitch_go_home start...")
-        self.set_waist_pitch_buttons(button_bend = False, button_raise = True)
+        self.set_direction(-1.0)
         deadline = time.time() + timeout
         while time.time() < deadline:
             if abs(self.g1_waist_pitch_state_value_out.value - self.min_angle) < tolerance:
@@ -306,17 +274,13 @@ class G1D_Mobile_Waist_Pitch_Controller:
         else:
             logger_mp.warning(f"[G1D_Mobile_Waist_Pitch_Controller] Waist pitch did not reach home within "
                               f"{timeout}s, stopping at {self.g1_waist_pitch_state_value_out.value:.4f} rad.")
-        self.set_waist_pitch_buttons(button_bend = False, button_raise = False)
+        self.set_direction(0.0)
         time.sleep(0.1)   # let the control thread publish the settled command before it stops
 
     def close(self):
-        try:
-            if shared_flag_is_set(self.output_enabled_in):
-                self.ctrl_waist_pitch_go_home()
-        finally:
-            self.running = False
-            self.waist_pitch_control_thread.join(timeout = 0.5)
-            logger_mp.info("[G1D_Mobile_Waist_Pitch_Controller] closed.")
+        self.running = False
+        self.waist_pitch_control_thread.join(timeout=0.5)
+        logger_mp.info("[G1D_Mobile_Waist_Pitch_Controller] closed.")
 
     def ctrl_g1_waist_pitch(self, q_target):
         self.g1_waist_pitch_msg.q = q_target

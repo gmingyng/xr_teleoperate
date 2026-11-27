@@ -10,6 +10,8 @@ logger_mp = logging_mp.getLogger(__name__)
 import time
 import argparse
 from multiprocessing import Value, Array, Lock
+from copy import deepcopy
+from queue import SimpleQueue
 import threading
 import numpy as np
 import pinocchio as pin
@@ -22,13 +24,13 @@ sys.path.append(parent_dir)
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
 from teleop.televuer.tv_wrapper import TeleVuerWrapper
-from teleop.robot_control.robot_arm import G1_29_ArmController, G1_29_Arm_Internal_Dex1_Controller
+from teleop.robot_control.robot_arm import DataBuffer, G1_29_ArmController, G1_29_Arm_Internal_Dex1_Controller
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK
 from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller, Dex1_1_Gripper_Controller
 from teleop.robot_control.robot_hand_inspire import Inspire_Controller_DFX, Inspire_Controller_FTP, Inspire_Controller_DFX_ctrl, Inspire_Controller_FTP_ctrl
 from teleop.robot_control.robot_hand_brainco import Brainco_Controller_hand, Brainco_Controller_ctrl
 from teleop.robot_control.mobile_control import G1D_Mobile_Lift_Controller, G1D_Mobile_Waist_Pitch_Controller
-from teleop.utils.instruction_map import ControlDataMapper, HandleInstruction
+from teleop.utils.instruction_map import ControlDataMapper
 from teleop.utils.robot_config import (
     ARM_ARGUMENT_CHOICES,
     SUPPORTED_ARM,
@@ -45,10 +47,13 @@ from teleop.utils.recording_schema import (
     RIGHT_EE_INDICES,
     build_operator_record,
     camera_quality_record,
+    lowcmd_to_record,
+    lowstate_to_record,
     select_motor_fields,
 )
 
 from teleop.teleimager.src.teleimager.image_client import ImageClient
+from teleop.utils.barcode import BarcodeReceiver
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 # from teleop.utils.motion_switcher import MotionSwitcher
@@ -61,6 +66,129 @@ def publish_reset_category(category: int, publisher): # Scene Reset signal
     msg = String_(data=str(category))
     publisher.Write(msg)
     logger_mp.info(f"published reset category: {category}")
+
+
+def beep_scan():
+    try:
+        from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+        client = AudioClient()
+        client.SetTimeout(2.0)
+        client.Init()
+        t = np.arange(1920) / 16000
+        env = np.clip(np.minimum(t, 0.12 - t) / 0.005, 0, 1)
+        pcm = (10000 * env * np.sin(2 * np.pi * 1600 * t)).astype("<i2").tobytes()
+        rc, _ = client.PlayStream("scan", str(time.monotonic_ns()), pcm)
+        if rc:
+            logger_mp.warning(f"Scan beep returned {rc}")
+    except Exception as exc:
+        logger_mp.warning(f"Scan beep failed: {exc}")
+
+
+class RecordingVoice:
+    def __init__(self):
+        self.voice_queue = SimpleQueue()
+        self.thread = threading.Thread(target=self._play_prompts, name="recording-voice", daemon=True)
+        self.thread.start()
+
+    def started(self):
+        self.voice_queue.put("开始录制")
+
+    def saved(self):
+        self.voice_queue.put("已保存")
+
+    def close(self):
+        self.voice_queue.put(None)
+        self.thread.join(timeout=5.0)
+
+    def _play_prompts(self):
+        client = None
+        while True:
+            message = self.voice_queue.get()
+            if message is None:
+                return
+            try:
+                if client is None:
+                    from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+                    client = AudioClient()
+                    client.SetTimeout(2.0)
+                    client.Init()
+                    code = client.SetVolume(60)
+                    if code != 0:
+                        raise RuntimeError(f"SetVolume returned {code}")
+                code = client.TtsMaker(message, 0)
+                if code != 0:
+                    raise RuntimeError(f"TtsMaker returned {code}")
+            except Exception as exc:
+                logger_mp.warning(f"Recording voice prompt failed: {exc}")
+                client = None
+
+
+def dex1_target_source(trigger_inputs, squeeze_inputs, ready, *, step, limits):
+    """Adapt XR pinch or dual-trigger input to absolute Dex1 motor targets."""
+    def read(values):
+        return np.asarray([value.value for value in values])
+
+    def target(measured, previous):
+        trigger = read(trigger_inputs)
+        squeeze = read(squeeze_inputs) if squeeze_inputs is not None else None
+        if not shared_flag_is_set(ready):
+            return measured.copy()
+        if squeeze is None:
+            return np.interp(trigger, (5.0, 7.0), limits)
+        closing = (trigger < 5.0) & (squeeze < 0.5)
+        opening = (trigger >= 5.0) & (squeeze >= 0.5)
+        requested = np.clip(measured + step * (opening.astype(float) - closing), *limits)
+        return np.where(closing | opening, requested, previous)
+
+    return target
+
+
+def capture_dex1_inputs(controller_type, args, trigger_inputs, squeeze_inputs, ready):
+    return dex1_target_source(
+        trigger_inputs, squeeze_inputs if args.dual_trigger_dex1_mode else None, ready,
+        step=controller_type.GRIPPER_STEP_RAD, limits=controller_type.GRIPPER_LIMITS_RAD,
+    )
+
+
+class R3InstructionSource:
+    def __init__(self):
+        from unitree_sdk2py.core.channel import ChannelSubscriber
+        from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_
+
+        self.subscriber = ChannelSubscriber("rt/wirelesscontroller", WirelessController_)
+        self.subscriber.Init()
+        self.instruction = dict(lx=0.0, ly=0.0, rx=0.0, ry=0.0, rbutton_A=False, rbutton_B=False)
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._subscribe, name="r3-instructions", daemon=True)
+        self.thread.start()
+
+    def _subscribe(self):
+        while not self.stop.is_set():
+            try:
+                message = self.subscriber.Read()
+                if message is not None:
+                    self.instruction = dict(
+                        lx=message.ly, ly=-message.lx, rx=-message.rx, ry=-message.ry,
+                        rbutton_A=int(message.keys) == 256, rbutton_B=int(message.keys) == 512,
+                    )
+            except Exception as exc:
+                logger_mp.info(f"R3 input failed: {exc}")
+                self.stop.wait(0.1)
+            self.stop.wait(0.01)
+
+    def read(self):
+        return self.instruction.copy()
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=1.0)
+
+
+def read_xr_instruction(tv_wrapper):
+    data = tv_wrapper.get_tele_data()
+    return dict(lx=-data.left_ctrl_thumbstickValue[1], ly=-data.left_ctrl_thumbstickValue[0],
+                rx=-data.right_ctrl_thumbstickValue[0], ry=-data.right_ctrl_thumbstickValue[1],
+                rbutton_A=data.right_ctrl_aButton, rbutton_B=data.right_ctrl_bButton)
 
 
 def get_source_git_commit():
@@ -190,6 +318,7 @@ if __name__ == '__main__':
     # Bound before the try so the finally can stop it even if startup fails part way.
     waist_pitch_ctrl = None
     mobile_ctrl = None
+    r3_input = None
     arm_ctrl = None
     output_enabled = Value('b', False, lock=True)
     ipc_server = None
@@ -197,6 +326,9 @@ if __name__ == '__main__':
     img_client = None
     tv_wrapper = None
     recorder = None
+    scanner = None
+    recording_voice = None
+    command_record = DataBuffer()
 
     try:
         if args.sim:
@@ -255,14 +387,21 @@ if __name__ == '__main__':
                 dual_gripper_data_lock = Lock()
                 dual_gripper_state_array = Array('d', 2, lock=False)   # current left, right gripper state(2) data.
                 dual_gripper_action_array = Array('d', 2, lock=False)  # current left, right gripper action(2) data.
-                arm_ctrl = G1_29_Arm_Internal_Dex1_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock,
-                                                              dual_gripper_state_array, dual_gripper_action_array,
-                                                              simulation_mode=args.sim,
-                                                              xr_motion_data_ready_in=xr_motion_data_ready,
-                                                              left_gripper_squeeze_in=left_gripper_squeeze_value,
-                                                              right_gripper_squeeze_in=right_gripper_squeeze_value,
-                                                              dual_trigger_mode=args.dual_trigger_dex1_mode,
-                                                              output_enabled_in=output_enabled)
+                target = capture_dex1_inputs(
+                    G1_29_Arm_Internal_Dex1_Controller, args, (left_gripper_value, right_gripper_value),
+                    (left_gripper_squeeze_value, right_gripper_squeeze_value), xr_motion_data_ready,
+                )
+
+                def capture_command(message):
+                    command_record.SetData(lowcmd_to_record(message))
+
+                arm_ctrl = G1_29_Arm_Internal_Dex1_Controller(
+                    gripper_target=target, on_command=capture_command if args.record else None,
+                    dual_gripper_data_lock=dual_gripper_data_lock,
+                    dual_gripper_state_out=dual_gripper_state_array,
+                    dual_gripper_action_out=dual_gripper_action_array,
+                    simulation_mode=args.sim, output_enabled_in=output_enabled,
+                )
             else:
                 arm_ctrl = G1_29_ArmController(simulation_mode=args.sim, output_enabled_in=output_enabled)
         elif args.arm == "H2":
@@ -292,10 +431,16 @@ if __name__ == '__main__':
             dual_gripper_data_lock = Lock()
             dual_gripper_state_array = Array('d', 2, lock=False)   # current left, right gripper state(2) data.
             dual_gripper_action_array = Array('d', 2, lock=False)  # current left, right gripper action(2) data.
-            gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, 
-                                                     dual_gripper_state_array, dual_gripper_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready,
-                                                     left_gripper_squeeze_in=left_gripper_squeeze_value, right_gripper_squeeze_in=right_gripper_squeeze_value,
-                                                     dual_trigger_mode=args.dual_trigger_dex1_mode, output_enabled_in=output_enabled)
+            target = capture_dex1_inputs(
+                Dex1_1_Gripper_Controller, args, (left_gripper_value, right_gripper_value),
+                (left_gripper_squeeze_value, right_gripper_squeeze_value), xr_motion_data_ready,
+            )
+            gripper_ctrl = Dex1_1_Gripper_Controller(
+                gripper_target=target, dual_gripper_data_lock=dual_gripper_data_lock,
+                dual_gripper_state_out=dual_gripper_state_array,
+                dual_gripper_action_out=dual_gripper_action_array,
+                simulation_mode=args.sim, output_enabled_in=output_enabled,
+            )
         elif args.ee == "inspire_dfx" and args.input_mode == "hand":
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
             right_hand_pos_array = Array('d', 75, lock = True)     # [input]
@@ -354,7 +499,7 @@ if __name__ == '__main__':
         # For mobile base and elevation control
         if args.base_type != "legs":
             try:
-                mobile_ctrl = G1D_Mobile_Lift_Controller(args.base_type, args.input_mode == "hand", output_enabled_in=output_enabled)
+                mobile_ctrl = G1D_Mobile_Lift_Controller(args.base_type, output_enabled_in=output_enabled)
             except Exception as e:
                 STOP = True
                 logger_mp.error(f"Failed to initialize mobile base/lift controller: {e}")
@@ -373,7 +518,8 @@ if __name__ == '__main__':
         else:
             waist_pitch_ctrl = None
         control_data_mapper = ControlDataMapper(arm_ctrl.get_current_waist_yaw_q()[0])
-        handle_instruction = HandleInstruction(args.input_mode == "hand", tv_wrapper, mobile_ctrl)
+        if mobile_ctrl is not None and args.input_mode == "hand":
+            r3_input = R3InstructionSource()
 
         # simulation mode
         if args.sim:
@@ -419,15 +565,23 @@ if __name__ == '__main__':
                 from teleop.utils.v3_writer import V3Writer
                 writer_type = V3Writer
                 name += "_lerobot_v3"
-            recorder = writer_type(task_dir = os.path.join(args.task_dir, name),
-                                     task_goal = args.task_goal,
-                                     task_desc = args.task_desc,
-                                     task_steps = args.task_steps,
-                                     frequency = args.frequency, 
-                                     rerun_log = not args.headless,
-                                     # Author: mingyang - Enable robot voice prompts for controller recording.
-                                     voice_prompts = not args.sim and args.control_source in ("controller", "both"),
-                                     extra_info = recording_info, barcode_scanner=args.barcode_scanner, scan_beep=not args.sim)
+            if args.barcode_scanner:
+                def play_scan_beep():
+                    threading.Thread(target=beep_scan, daemon=True).start()
+
+                scanner = BarcodeReceiver(on_scan=play_scan_beep if not args.sim else None)
+            writer_hooks = {}
+            if (writer_type is EpisodeWriter and not args.sim
+                    and args.control_source in ("controller", "both")):
+                recording_voice = RecordingVoice()
+                writer_hooks = dict(on_episode_started=recording_voice.started,
+                                    on_episode_saved=recording_voice.saved)
+            recorder = writer_type(
+                task_dir=os.path.join(args.task_dir, name),
+                task_goal=args.task_goal, task_desc=args.task_desc, task_steps=args.task_steps,
+                frequency=args.frequency, rerun_log=not args.headless, extra_info=recording_info,
+                scanner=scanner, **writer_hooks,
+            )
 
         arm_modes = ["hold", "hold"]
         hold_targets = [None, None]
@@ -665,7 +819,7 @@ if __name__ == '__main__':
             waist_pitch_state = None
             waist_pitch_action = None
             # One read per frame, so every consumer below sees the same controller sample.
-            handle_instruction_data = handle_instruction.get_instruction()
+            handle_instruction_data = r3_input.read() if r3_input is not None else read_xr_instruction(tv_wrapper)
             if  mobile_ctrl is not None:
                 height_state = mobile_ctrl.g1_height_state_array_out
                 vel_data = control_data_mapper.update(ry=handle_instruction_data['ry'])
@@ -687,8 +841,9 @@ if __name__ == '__main__':
                 sol_q = np.concatenate([sol_q, waist_yaw_action])
 
             if waist_pitch_ctrl is not None:
-                waist_pitch_ctrl.set_waist_pitch_buttons(button_bend=handle_instruction_data['rbutton_B'],
-                                                         button_raise=handle_instruction_data['rbutton_A'])
+                bend = bool(handle_instruction_data["rbutton_B"])
+                raise_waist = bool(handle_instruction_data["rbutton_A"])
+                waist_pitch_ctrl.set_direction(float(bend) - float(raise_waist))
                 waist_pitch_state = [waist_pitch_ctrl.get_current_waist_pitch_state()]
                 waist_pitch_action = [waist_pitch_ctrl.get_current_waist_pitch_action()]
 
@@ -769,11 +924,10 @@ if __name__ == '__main__':
                 if RECORD_RUNNING:
                     lowstate_record = None
                     commanded_record = None
-                    get_recording_snapshot = getattr(arm_ctrl, "get_recording_snapshot", None)
-                    if callable(get_recording_snapshot):
-                        lowstate_record, commanded_record = get_recording_snapshot()
-                        if not arm_control_active:
-                            commanded_record = None
+                    if args.ee == "dex1_internal":
+                        lowstate_record = lowstate_to_record(arm_ctrl.get_lowstate())
+                        if arm_control_active:
+                            commanded_record = deepcopy(command_record.GetData())
 
                     left_motor = None
                     right_motor = None
@@ -1017,7 +1171,11 @@ if __name__ == '__main__':
 
         try:
             if waist_pitch_ctrl is not None:
-                waist_pitch_ctrl.close()
+                try:
+                    if shared_flag_is_set(output_enabled):
+                        waist_pitch_ctrl.ctrl_waist_pitch_go_home()
+                finally:
+                    waist_pitch_ctrl.close()
         except Exception as e:
             logger_mp.error(f"Failed to home and stop waist pitch controller: {e}")
 
@@ -1033,6 +1191,8 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to stop keyboard listener or ipc server: {e}")
         
         try:
+            if r3_input is not None:
+                r3_input.close()
             if img_client is not None:
                 img_client.close()
         except Exception as e:
@@ -1067,4 +1227,11 @@ if __name__ == '__main__':
                 recorder.close()
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
+        finally:
+            try:
+                if scanner is not None:
+                    scanner.close()
+            finally:
+                if recording_voice is not None:
+                    recording_voice.close()
         logger_mp.info("Finally, exiting program.")

@@ -1,7 +1,6 @@
 import numpy as np
 import threading
 import time
-from copy import deepcopy
 from enum import IntEnum
 
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber # dds
@@ -13,7 +12,6 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 from teleop.robot_control.dds_utils import wait_for_dds
 from teleop.utils.output_gate import shared_flag_is_set
-from teleop.utils.recording_schema import lowcmd_to_record, lowstate_to_record
 
 kTopicLowCommand_Debug  = "rt/lowcmd"
 kTopicLowState = "rt/lowstate"
@@ -401,18 +399,16 @@ class G1_29_Internal_Dex1_JointIndex(IntEnum):
     kRightDex1_1 = 33
 
 class G1_29_Arm_Internal_Dex1_Controller:
-    def __init__(self, left_gripper_value_in, right_gripper_value_in, dual_gripper_data_lock=None, dual_gripper_state_out=None, dual_gripper_action_out=None,
-                 simulation_mode=False, xr_motion_data_ready_in=None,
-                 left_gripper_squeeze_in=None, right_gripper_squeeze_in=None, dual_trigger_mode=False,
+    GRIPPER_STEP_RAD = 0.18
+    GRIPPER_LIMITS_RAD = (0.0, 5.4)
+
+    def __init__(self, *, gripper_target=None, on_command=None, dual_gripper_data_lock=None,
+                 dual_gripper_state_out=None, dual_gripper_action_out=None, simulation_mode=False,
                  output_enabled_in=None):
         logger_mp.info("Initialize G1_29_Arm_Internal_Dex1_Controller...")
 
-        self.left_gripper_value_in = left_gripper_value_in
-        self.right_gripper_value_in = right_gripper_value_in
-        self.left_gripper_squeeze_in = left_gripper_squeeze_in
-        self.right_gripper_squeeze_in = right_gripper_squeeze_in
-        self.dual_trigger_mode = dual_trigger_mode
-        self.xr_motion_data_ready_in = xr_motion_data_ready_in
+        self.gripper_target = gripper_target
+        self.on_command = on_command
         self.output_enabled_in = output_enabled_in
         self.dual_gripper_data_lock = dual_gripper_data_lock
         self.dual_gripper_state_out = dual_gripper_state_out
@@ -505,7 +501,8 @@ class G1_29_Arm_Internal_Dex1_Controller:
             #     self.q_target[-1] = cmd.q
             #     self.tauff_target[-1] = 0.0
 
-        self.command_snapshot = lowcmd_to_record(self.msg)
+        if self.on_command is not None:
+            self.on_command(self.msg)
 
         self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
         self.publish_thread.daemon = True
@@ -522,14 +519,6 @@ class G1_29_Arm_Internal_Dex1_Controller:
             time.sleep(0.002)
 
     def _ctrl_motor_state(self):
-        DELTA_GRIPPER_CMD = 0.18
-        THUMB_INDEX_DISTANCE_MIN = 5.0
-        THUMB_INDEX_DISTANCE_MAX = 7.0
-        LEFT_MAPPED_MIN = 0.0
-        RIGHT_MAPPED_MIN = 0.0
-        LEFT_MAPPED_MAX = 5.40
-        RIGHT_MAPPED_MAX = 5.40
-
         while self.running:
             start_time = time.time()
 
@@ -539,51 +528,18 @@ class G1_29_Arm_Internal_Dex1_Controller:
             with self.ctrl_lock:
                 q_target = self.q_target.copy()
                 tauff_target = self.tauff_target.copy()
-            with self.left_gripper_value_in.get_lock():
-                left_gripper_value = self.left_gripper_value_in.value
-            with self.right_gripper_value_in.get_lock():
-                right_gripper_value = self.right_gripper_value_in.value
-            if self.dual_trigger_mode:
-                with self.left_gripper_squeeze_in.get_lock():
-                    left_squeeze_value = self.left_gripper_squeeze_in.value
-                with self.right_gripper_squeeze_in.get_lock():
-                    right_squeeze_value = self.right_gripper_squeeze_in.value
-            if self.xr_motion_data_ready_in is not None:
-                with self.xr_motion_data_ready_in.get_lock():
-                    xr_motion_data_ready = self.xr_motion_data_ready_in.value
-            else:
-                xr_motion_data_ready = True
-
             if self.simulation_mode:
                 cliped_q_target = q_target
             else:
                 cliped_q_target = self.clip_arm_q_target(q_target, velocity_limit=self.arm_velocity_limit)
 
             gripper_state = self.get_current_dual_gripper_q()
-            if xr_motion_data_ready and self.dual_trigger_mode:
-                # trigger value range: [10.0, 0.0], 10.0 means no press, 0.0 means full press
-                # squeeze value range: [0.0, 1.0],  0.0 means no press, 1.0 means full press
-                # pressing both or neither keeps the last target, so the gripper holds its grip force
-                with self.ctrl_lock:
-                    if left_gripper_value < 5.0 and left_squeeze_value < 0.5:        # only left trigger is pressed, gradually close
-                        self.gripper_q_target[0] = np.clip(gripper_state[0] - DELTA_GRIPPER_CMD, LEFT_MAPPED_MIN, LEFT_MAPPED_MAX)
-                    elif left_gripper_value >= 5.0 and left_squeeze_value >= 0.5:    # only left squeeze is pressed, gradually open
-                        self.gripper_q_target[0] = np.clip(gripper_state[0] + DELTA_GRIPPER_CMD, LEFT_MAPPED_MIN, LEFT_MAPPED_MAX)
-                    if right_gripper_value < 5.0 and right_squeeze_value < 0.5:      # only right trigger is pressed, gradually close
-                        self.gripper_q_target[1] = np.clip(gripper_state[1] - DELTA_GRIPPER_CMD, RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX)
-                    elif right_gripper_value >= 5.0 and right_squeeze_value >= 0.5:  # only right squeeze is pressed, gradually open
-                        self.gripper_q_target[1] = np.clip(gripper_state[1] + DELTA_GRIPPER_CMD, RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX)
-            elif xr_motion_data_ready:
-                left_target_action = np.interp(left_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [LEFT_MAPPED_MIN, LEFT_MAPPED_MAX])
-                right_target_action = np.interp(right_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX])
-                with self.ctrl_lock:
-                    self.gripper_q_target = np.array([left_target_action, right_target_action])
+            if self.gripper_target is not None:
+                self.gripper_q_target = self.gripper_target(gripper_state, self.gripper_q_target)
             else:
-                with self.ctrl_lock:
-                    self.gripper_q_target = gripper_state.copy()
-            with self.ctrl_lock:
-                gripper_q_target = self.gripper_q_target.copy()
-            gripper_q_cmd = np.clip(gripper_q_target, gripper_state - DELTA_GRIPPER_CMD, gripper_state + DELTA_GRIPPER_CMD)
+                self.gripper_q_target = gripper_state
+            step = self.GRIPPER_STEP_RAD
+            gripper_q_cmd = np.clip(self.gripper_q_target, gripper_state - step, gripper_state + step)
 
             if self.smooth_filter:
                 self.smooth_filter.add_data(gripper_q_cmd)
@@ -612,8 +568,8 @@ class G1_29_Arm_Internal_Dex1_Controller:
                     self.dual_gripper_action_out[:] = gripper_q_cmd
 
             self.msg.crc = self.crc.Crc(self.msg)
-            with self.ctrl_lock:
-                self.command_snapshot = lowcmd_to_record(self.msg)
+            if self.on_command is not None:
+                self.on_command(self.msg)
             self.lowcmd_publisher.Write(self.msg)
 
             sleep_time = max(0.0, self.control_dt - (time.time() - start_time))
@@ -665,12 +621,9 @@ class G1_29_Arm_Internal_Dex1_Controller:
         data = self.lowstate_buffer.GetData()
         return np.array([data.motor_state[self.left_index].q, data.motor_state[self.right_index].q])
 
-    def get_recording_snapshot(self):
-        """Return consistent JSON-safe LowState and last-published LowCmd data."""
-        lowstate = lowstate_to_record(self.lowstate_buffer.GetData())
-        with self.ctrl_lock:
-            command = deepcopy(self.command_snapshot)
-        return lowstate, command
+    def get_lowstate(self):
+        """Return the latest DDS feedback for read-only inspection."""
+        return self.lowstate_buffer.GetData()
 
     def ctrl_dual_arm_go_home(self):
         logger_mp.info("[G1_29_Arm_Internal_Dex1_Controller] ctrl_dual_arm_go_home start...")

@@ -7,33 +7,16 @@ import time
 from copy import deepcopy
 from .rerun_visualizer import RerunLogger
 from queue import Queue, Empty
-from .recording_schema import BarcodeReceiver
 from threading import Lock, Thread
 import logging_mp
 import re
 import shutil
 logger_mp = logging_mp.getLogger(__name__)
 
-def beep_scan():
-    try:
-        from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
-        client = AudioClient()
-        client.SetTimeout(2.0)
-        client.Init()
-        t = np.arange(1920) / 16000
-        env = np.clip(np.minimum(t, 0.12 - t) / 0.005, 0, 1)
-        pcm = (10000 * env * np.sin(2 * np.pi * 1600 * t)).astype("<i2").tobytes()
-        rc, _ = client.PlayStream("scan", str(time.monotonic_ns()), pcm)
-        if rc:
-            logger_mp.warning(f"Scan beep returned {rc}")
-    except Exception as exc:
-        logger_mp.warning(f"Scan beep failed: {exc}")
-
-
 class EpisodeWriter():
     def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None,
                  frequency=30, image_size=[640, 480], rerun_log = True,
-                 extra_info=None, voice_prompts=False, barcode_scanner=False, scan_beep=False):
+                 extra_info=None, *, scanner=None, on_episode_started=None, on_episode_saved=None):
         """
         image_size: [width, height]
         """
@@ -82,40 +65,14 @@ class EpisodeWriter():
         self.stop_worker = False
         self.need_save = False  # Flag to indicate when save_episode is triggered
         self.worker_thread = Thread(target=self.process_queue)
-        # Author: mingyang - Queue recording prompts so audio RPCs never block the control loop.
-        self.voice_queue = Queue() if voice_prompts else None
-        if voice_prompts:
-            self.voice_thread = Thread(target=self._play_prompts, name="recording-voice", daemon=True)
-            self.voice_thread.start()
-        notify = (lambda: Thread(target=beep_scan, daemon=True).start()) if scan_beep else None
-        self.scanner = BarcodeReceiver(on_scan=notify) if barcode_scanner else None
+        self.scanner = scanner
+        self.on_episode_started = on_episode_started
+        self.on_episode_saved = on_episode_saved
         self.scan_summary = None
         self.worker_thread.start()
 
         logger_mp.info("==> EpisodeWriter initialized successfully.")
     
-    def _play_prompts(self):
-        client = None
-        while True:
-            message = self.voice_queue.get()
-            if message is None:
-                return
-            try:
-                if client is None:
-                    from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
-                    client = AudioClient()
-                    client.SetTimeout(2.0)
-                    client.Init()
-                    code = client.SetVolume(60)
-                    if code != 0:
-                        raise RuntimeError(f"SetVolume returned {code}")
-                code = client.TtsMaker(message, 0)
-                if code != 0:
-                    raise RuntimeError(f"TtsMaker returned {code}")
-            except Exception as exc:
-                logger_mp.warning(f"Recording voice prompt failed: {exc}")
-                client = None
-
     def is_ready(self):
         return self.is_available
 
@@ -200,9 +157,8 @@ class EpisodeWriter():
 
         self.is_available = False  # After the episode is created, the class is marked as unavailable until the episode is successfully saved
         logger_mp.info(f"==> New episode created: {self.episode_dir}")
-        # Author: mingyang - Announce only after the episode was successfully created.
-        if self.voice_queue is not None:
-            self.voice_queue.put_nowait("开始录制")
+        if self.on_episode_started is not None:
+            self.on_episode_started()
         return True  # Return True if the episode is successfully created
         
     def get_episode_elapsed_s(self, sample_monotonic_ns=None):
@@ -365,9 +321,8 @@ class EpisodeWriter():
                 f.write(',\n"_unitree": ' + json.dumps(self.scan_summary))
             f.write("\n}")
 
-        # Author: mingyang - Announce after closing data.json, before accepting the next episode.
-        if self.voice_queue is not None:
-            self.voice_queue.put_nowait("已保存")
+        if self.on_episode_saved is not None:
+            self.on_episode_saved()
         self.need_save = False     # Reset the save flag
         self.is_available = True   # Mark the class as available after saving
         logger_mp.info(f"==> Episode saved successfully to {self.json_path}.")
@@ -383,8 +338,3 @@ class EpisodeWriter():
             time.sleep(0.01)
         self.stop_worker = True
         self.worker_thread.join()
-        if self.scanner:
-            self.scanner.close()
-        if self.voice_queue is not None:
-            self.voice_queue.put_nowait(None)
-            self.voice_thread.join(timeout=5.0)

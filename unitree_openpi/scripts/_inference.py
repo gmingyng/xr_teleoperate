@@ -5,18 +5,19 @@ import numpy as np
 import threading
 import time
 
-from .robot_ctrl.controller import parse_policy_chunk
-from .utils.websocket import PolicyClient
+from ..policy_protocol import parse_joint_actions, parse_policy_chunk, state_vector
+from ..utils.websocket import PolicyClient
 
 log = logging.getLogger(__name__)
 
 
-def observation(controller, cameras, config, sequence, prompt):
+def observation(controller, cameras, config, sequence, prompt, *, last_action=None):
     state, poses = controller.snapshot()
     frames = cameras.snapshot()
     settings = config["policy"]
-    result = {settings["state_key"]: controller.state_vector(state, poses),
-              settings["prompt_key"]: prompt}
+    result = {settings["state_key"]: state_vector(state, poses, settings)}
+    if prompt and prompt.strip():
+        result[settings["prompt_key"]] = prompt
     images = {settings["image_keys"][name]: frame["image"] for name, frame in frames.items()}
     if settings.get("image_container_key"):
         result[settings["image_container_key"]] = images
@@ -34,9 +35,9 @@ def observation(controller, cameras, config, sequence, prompt):
         "joint_positions": state["q14"].tolist(), "joint_velocities": state["dq14"].tolist(),
         "waist_q3": state["waist_q3"].tolist(), "grip_q2": state["grip_q2"].tolist(),
         "state_age_s": now - state_received,
-        "cameras": {name: {key: value for key, value in frame.items() if key not in ("image", "review_right_eye")}
+        "cameras": {name: {key: value for key, value in frame.items() if key not in ("image", "head_views")}
                     for name, frame in frames.items()},
-        "last_action": controller.last_action,
+        "last_action": last_action if last_action is not None else {"status": "idle"},
     }
     return result, earliest
 
@@ -44,17 +45,16 @@ def observation(controller, cameras, config, sequence, prompt):
 def execute_policy(controller, response, sequence, expires, stop, *, recorder=None):
     config = controller.config
     settings = config["policy"]
+    last_action = None
     if settings.get("action_space") == "joint":
-        actions = np.asarray(response["actions"], dtype=float)
-        if (actions.ndim != 2 or actions.shape[1] != 16 or
-                not 1 <= len(actions) <= settings["max_chunk_steps"] or not np.isfinite(actions).all()):
-            raise ValueError("expected a finite (T,16) absolute joint action chunk")
+        actions = parse_joint_actions(response, max_steps=settings["max_chunk_steps"]).copy()
+        grippers = actions[:, [7, 15]]
+        actions[:, [7, 15]] = np.where(grippers <= 5.0, 2.2, grippers)
         if not controller.execute:
             if recorder is not None:
                 recorder.target = actions[0].copy()
             print(f"Cloud actions [{sequence}] shape={actions.shape} first={actions[0]}", flush=True)
-            controller.last_action = {"status": "observing", "executed": False}
-            return
+            return {"status": "observing", "executed": False}
         period = 1.0 / settings.get("target_hz", 50.0)
         chunk = actions[:settings["execute_steps"]]
         for i, row in enumerate(chunk):
@@ -66,10 +66,10 @@ def execute_policy(controller, response, sequence, expires, stop, *, recorder=No
                                       gripper_positions=row[[7, 15]], wait_for_arrival=False)
             if recorder is not None:
                 recorder.target = row.copy()
-            controller.last_action = dict(status, observation_id=sequence, step=i)
+            last_action = dict(status, observation_id=sequence, step=i)
             if i + 1 < len(chunk):
                 stop.wait(max(0.0, min(started + period, expires) - time.monotonic()))
-        return
+        return last_action
     eef, joints = parse_policy_chunk(response, settings)
     if eef is not None:
         controller.validate_deltas(eef)
@@ -81,13 +81,116 @@ def execute_policy(controller, response, sequence, expires, stop, *, recorder=No
         status = controller.apply(None if eef is None else eef[index], min(expires,
             time.monotonic() + config["motion"]["action_timeout_s"]),
             joint_positions=None if joints is None else joints[index])
-        controller.last_action = dict(status, observation_id=sequence, step=index,
-                                      discarded_steps=length-count)
+        last_action = dict(status, observation_id=sequence, step=index, discarded_steps=length-count)
         if index + 1 < count:
             stop.wait(1.0 / config["motion"]["command_hz"])
+    return last_action
 
 
-def _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, handle_response, scanner=None):
+def rtc_loop(config, controller, cameras, client, prompt, max_steps, stop, handle_response, scanner, feedback):
+    from concurrent.futures import ThreadPoolExecutor
+    import math
+
+    settings = config["policy"]
+    period = 1 / settings["target_hz"]
+    sequence = completed = 0
+    plan = pending = None
+    delay = 1
+    worker = ThreadPoolExecutor(max_workers=1)
+    try:
+        spec = client.connect()["g1d"]
+        expected = dict(rtc=True, action_space="joint", action_representation="absolute",
+                        action_dim=16, state_dim=17 if scanner else 16, gripper_units="motor_position")
+        if any(spec.get(key) != value for key, value in expected.items()):
+            raise ValueError("RTC requires a matching G1-D joint server started with --rtc")
+        horizon = spec["action_horizon"]
+        if not 2 <= horizon <= settings["max_chunk_steps"]:
+            raise ValueError("Invalid action horizon for RTC")
+        chunk_len = min(horizon, settings["execute_steps"])
+        prefix_len = settings["rtc_prefix_len"]
+        if prefix_len < 1:
+            raise ValueError("--rtc-prefix-len must be positive")
+        replan_at = max(0, chunk_len - prefix_len)
+        while not stop.is_set():
+            now = time.monotonic()
+            flag = bool(scanner and scanner.frame(time.monotonic_ns())["scan_success"])
+            if plan is not None and (flag != plan_flag or now >= expires):
+                controller.freeze()
+                plan = None
+
+            if pending is not None and pending.done():
+                reply = pending.result()
+                pending = None
+                actions = parse_joint_actions(reply, max_steps=horizon, dtype=np.float32)
+                if len(actions) != horizon or reply.get("observation_id", sequence) != sequence:
+                    raise ValueError("Invalid RTC policy response")
+                offset = max(row - prefix_start, int((now - requested) / period)) if guided else 0
+                delay = max(1, math.ceil((now - requested) / period))
+                if now >= deadline:
+                    controller.freeze()
+                    plan = None
+                    log.warning("Discarding expired RTC reply; requesting a fresh observation")
+                    continue
+                if flag == requested_flag and offset < chunk_len:
+                    plan, row, plan_flag, expires = actions[:chunk_len], offset, flag, deadline
+                    origin = requested if guided else now
+                    plan_sequence = sequence
+                    completed += 1
+
+            if plan is not None:
+                row = max(row, int((now - origin) / period))
+                if row >= chunk_len:
+                    controller.freeze()
+                    plan = None
+            finished = max_steps and completed >= max_steps
+            if finished and plan is None:
+                break
+
+            if not finished and pending is None and (plan is None or row >= replan_at):
+                sequence += 1
+                obs, observed = observation(
+                    controller, cameras, config, sequence, prompt, last_action=feedback.get("last_action"),
+                )
+                if scanner:
+                    key = settings["state_key"]
+                    obs[key] = np.concatenate(([np.float32(flag)], obs[key]))
+                    obs["_unitree"]["scan_success"] = flag
+                requested = time.monotonic()
+                deadline = observed + settings["max_observation_age_s"]
+                if plan is not None:
+                    row = max(row, int((requested - origin) / period))
+                guided = plan is not None and row < chunk_len
+                if guided:
+                    prefix_start = row
+                    prefix = plan[row:].copy()
+                    obs["rtc_prefix"] = prefix
+                    obs["rtc_delay"] = min(delay, len(prefix))
+                requested_flag = flag
+                pending = worker.submit(client.infer, obs, timeout_s=None)
+
+            if plan is None:
+                stop.wait(min(period, 0.005))
+                continue
+            if row < chunk_len and time.monotonic() < expires:
+                if not scanner or bool(scanner.frame(time.monotonic_ns())["scan_success"]) == plan_flag:
+                    status = handle_response(controller, {"actions": plan[row:row+1]}, plan_sequence,
+                                             expires, stop)
+                    if status is not None:
+                        feedback["last_action"] = status
+            row += 1
+            stop.wait(max(0, origin + row * period - time.monotonic()))
+        return completed
+    finally:
+        controller.freeze()
+        try:
+            client.close()
+        finally:
+            worker.shutdown(wait=True, cancel_futures=True)
+
+
+def _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, handle_response, scanner, feedback):
+    if config["policy"].get("rtc"):
+        return rtc_loop(config, controller, cameras, client, prompt, max_steps, stop, handle_response, scanner, feedback)
     sequence, completed = 0, 0
     while not stop.is_set() and (not max_steps or completed < max_steps):
         started = time.monotonic()
@@ -103,7 +206,9 @@ def _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, ha
                         raise ValueError("server does not advertise the absolute G1-D joint protocol")
                 log.info("Connected to policy (%s)", metadata)
             sequence += 1
-            obs, observed = observation(controller, cameras, config, sequence, prompt)
+            obs, observed = observation(
+                controller, cameras, config, sequence, prompt, last_action=feedback.get("last_action"),
+            )
             flag = False
             if scanner:
                 flag = scanner.frame(time.monotonic_ns())["scan_success"]
@@ -131,12 +236,14 @@ def _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, ha
                 action_stop = UntilScan()
                 if action_stop.is_set():
                     continue
-            handle_response(controller, response, sequence, expires, action_stop)
+            status = handle_response(controller, response, sequence, expires, action_stop)
+            if status is not None:
+                feedback["last_action"] = status
             completed += 1
-            log.info("Observation %d: %s", sequence, controller.last_action["status"])
+            log.info("Observation %d: %s", sequence, feedback.get("last_action", {}).get("status", "idle"))
         except Exception as exc:
             controller.freeze()
-            controller.last_action = {"status": "error", "observation_id": sequence,
+            feedback["last_action"] = {"status": "error", "observation_id": sequence,
                                       "message": str(exc)}
             log.warning("Holding; inference/action failed: %s", exc)
             client.close()  # Discard delayed replies; reconnect with a new observation.
@@ -151,17 +258,18 @@ def _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, ha
 def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, handle_response=execute_policy, reset_first=False, record_dir=None):
     stop = threading.Event() if stop is None else stop
     client = PolicyClient(config["policy"])
+    feedback = {}
     completed = 0
 
     def infer(scanner):
         if record_dir is None:
-            return _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, handle_response, scanner)
+            return _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, handle_response, scanner, feedback)
         from functools import partial
-        from .utils.review_video import ReviewVideo
+        from ._review_video import ReviewVideo
         with ReviewVideo(record_dir, cameras, controller, prompt) as recorder:
             handler = partial(handle_response, recorder=recorder)
             try:
-                return _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, handler, scanner)
+                return _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, handler, scanner, feedback)
             except KeyboardInterrupt:
                 controller.freeze()
                 raise
@@ -169,7 +277,7 @@ def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, handl
     def session():
         if not config["policy"].get("barcode_scanner"):
             return infer(None)
-        from teleop.utils.recording_schema import BarcodeReceiver
+        from teleop.utils.barcode import BarcodeReceiver
         scanner = BarcodeReceiver()
         try:
             scanner.begin(time.monotonic_ns())
@@ -183,8 +291,8 @@ def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, handl
             cameras.start()
             return session()
 
-        from .robot_ctrl.joint_motion import joint_limits
-        from .scripts.reset_dual_arms import move_to_reset
+        from ..robot_ctrl.joint_motion import joint_limits
+        from .reset_dual_arms import move_to_reset
 
         limits = joint_limits(config)
         cameras_started = False
@@ -204,6 +312,8 @@ def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, handl
                 log.info("Inference cancelled; returning to reset.")
             controller.freeze()
             client.close()
+            if max_steps and completed >= max_steps:
+                break
     finally:
         # Each resource is released even when another close operation fails.
         try:

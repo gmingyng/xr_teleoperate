@@ -9,7 +9,8 @@ import time
 import numpy as np
 
 from teleop.utils.output_gate import motion_input_is_live
-from teleop.utils.recording_schema import BarcodeReceiver
+from teleop.utils.barcode import BarcodeReceiver
+from unitree_openpi.policy_protocol import joint_state_vector, parse_joint_actions
 from unitree_openpi.robot_ctrl.controller import EEFController
 from unitree_openpi.robot_ctrl.dds import G1DDSBackend
 from unitree_openpi.robot_ctrl.kinematics import G1DKinematics
@@ -89,10 +90,7 @@ def predict(client, obs, state_dim):
     response = client.infer(obs)
     if response.get("observation_id", obs["_unitree"]["sequence"]) != obs["_unitree"]["sequence"]:
         raise ValueError("Mismatched observation_id")
-    rows = np.asarray(response["actions"], dtype=float)
-    if rows.ndim != 2 or rows.shape[1] != 16 or not len(rows) or not np.isfinite(rows).all():
-        raise ValueError("Invalid absolute joint action chunk")
-    return rows
+    return parse_joint_actions(response)
 
 
 def run(args):
@@ -100,7 +98,6 @@ def run(args):
     from teleop.utils.episode_writer import EpisodeWriter
     cfg = load_config(ROOT/"unitree_openpi/config/g1d.json")
     cfg["policy"].update(url=args.url, action_space="joint")
-    cfg["cameras"]["record_right_eye"] = True
     period = 1 / args.hz
     limits = np.asarray(cfg["policy"]["gripper_command_limits"])
     arb = ActionArbiter()
@@ -110,7 +107,7 @@ def run(args):
         ctrl = EEFController(cfg,G1DDSBackend(cfg),G1DKinematics(cfg),execute=args.execute,control_waist=False)
         stack.callback(ctrl.close)
         ctrl.connect()
-        cam = CameraCapture(cfg["cameras"])
+        cam = CameraCapture(cfg["cameras"], head_views=("right",))
         stack.callback(cam.close)
         cam.start()
         xr_source = TeleVuerWrapper(False, display_mode="pass-through",arm_reference_mode="head_yaw")
@@ -178,7 +175,7 @@ def run(args):
                 time.sleep(period)
                 continue
             armed = True
-            state, poses = ctrl.snapshot()
+            state, _ = ctrl.snapshot()
             frames = cam.snapshot()
             ns = time.monotonic_ns()
             meta = scanner.frame(ns) if scanner else {"scan_success":False,"scan_trigger":False,"barcode":None}
@@ -194,7 +191,7 @@ def run(args):
                 finish_segment(recorder)
                 recorder = None
                 active = False
-            feedback = ctrl.state_vector(state,poses)
+            feedback = joint_state_vector(state)
             images = {cfg["policy"]["image_keys"][k]: v["image"] for k,v in frames.items()}
             expires = min(state["received_monotonic_s"],*(v["received_monotonic_s"] for v in frames.values())) + cfg["policy"]["max_observation_age_s"]
             if pending and pending.done():
@@ -225,7 +222,7 @@ def run(args):
             ctrl.apply(None,expires,joint_positions=np.r_[row[:7],row[8:15]],
                        gripper_positions=row[[7,15]],wait_for_arrival=False)
             if human and active:
-                rgb = (images["observation/images/high"],frames["head"]["review_right_eye"],
+                rgb = (images["observation/images/high"],frames["head"]["head_views"]["right"],
                        images["observation/images/left_wrist"],images["observation/images/right_wrist"])
                 recorder.add_item({k:im[:,:,::-1].copy() for k,im in zip(CAMERAS,rgb)},
                                   states=parts(feedback),actions=parts(row),unitree=meta,
@@ -240,7 +237,7 @@ def main():
     p.add_argument("--prompt",required=True)
     p.add_argument("--task-dir",type=Path,default=Path.home()/"g1d_dataset/dagger")
     p.add_argument("--hz",type=int,default=30)
-    p.add_argument("--max-execute",type=int,default=15)
+    p.add_argument("--max-execute",type=int,default=20)
     p.add_argument("--barcode-scanner",action="store_true")
     p.add_argument("--execute",action="store_true",help="enable hardware actions and record executed corrections")
     p.add_argument("--record-format", choices=("raw","lerobot_v3"), default="raw")

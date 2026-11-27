@@ -255,41 +255,20 @@ kTopicGripperRightCommand = "rt/dex1/right/cmd"
 kTopicGripperRightState = "rt/dex1/right/state"
 
 class Dex1_1_Gripper_Controller:
-    def __init__(self, left_gripper_value_in, right_gripper_value_in, dual_gripper_data_lock = None, dual_gripper_state_out = None, dual_gripper_action_out = None, 
-                       filter = True, fps = 200.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None,
-                       left_gripper_squeeze_in = None, right_gripper_squeeze_in = None, dual_trigger_mode = False,
-                       output_enabled_in = None):
-        """
-        [note] A *_array type parameter requires using a multiprocessing Array, because it needs to be passed to the internal child process
+    GRIPPER_STEP_RAD = 0.18
+    GRIPPER_LIMITS_RAD = (0.0, 5.4)
 
-        left_gripper_value_in: [input] Left ctrl data (required from XR device) to control_thread
-
-        right_gripper_value_in: [input] Right ctrl data (required from XR device) to control_thread
-
-        dual_gripper_data_lock: Data synchronization lock for dual_gripper_state_array and dual_gripper_action_array
-
-        dual_gripper_state_out: [output] Return left(1), right(1) gripper motor state
-
-        dual_gripper_action_out: [output] Return left(1), right(1) gripper motor action
-
-        fps: Control frequency
-
-        Unit_Test: Whether to enable unit testing
-
-        simulation_mode: Whether to use simulation mode (default is False, which means using real robot)
-
-        left_gripper_squeeze_in / right_gripper_squeeze_in: [input] Squeeze (side trigger) data, only used in dual trigger mode
-
-        dual_trigger_mode: Whether the gripper is driven by the two XR controller triggers instead of the trigger/pinch value
-        """
-
+    def __init__(self, *, gripper_target=None, dual_gripper_data_lock=None,
+                 dual_gripper_state_out=None, dual_gripper_action_out=None,
+                 filter=True, fps=200.0, Unit_Test=False, simulation_mode=False,
+                 output_enabled_in=None):
         logger_mp.info("Initialize Dex1_1_Gripper_Controller...")
 
         self.fps = fps
         self.Unit_Test = Unit_Test
         self.gripper_sub_ready = False
         self.simulation_mode = simulation_mode
-        self.dual_trigger_mode = dual_trigger_mode
+        self.gripper_target = gripper_target
         
         if filter and not self.simulation_mode:
             self.smooth_filter = WeightedMovingFilter(np.array([0.5, 0.3, 0.2]), 2)
@@ -318,9 +297,10 @@ class Dex1_1_Gripper_Controller:
 
         wait_for_dds(lambda: self.gripper_sub_ready, "Dex1_1_Gripper_Controller")
 
-        self.gripper_control_thread = threading.Thread(target=self.control_thread, args=(left_gripper_value_in, right_gripper_value_in, self.left_gripper_state_value, self.right_gripper_state_value,
-                                                                                         dual_gripper_data_lock, dual_gripper_state_out, dual_gripper_action_out, xr_motion_data_ready_in,
-                                                                                         left_gripper_squeeze_in, right_gripper_squeeze_in, output_enabled_in))
+        self.gripper_control_thread = threading.Thread(
+            target=self.control_thread,
+            args=(dual_gripper_data_lock, dual_gripper_state_out, dual_gripper_action_out, output_enabled_in),
+        )
         self.gripper_control_thread.daemon = True
         self.gripper_control_thread.start()
 
@@ -345,24 +325,10 @@ class Dex1_1_Gripper_Controller:
         self.RightGripperCmb_publisher.Write(self.right_gripper_msg)
         # logger_mp.debug("gripper ctrl publish ok.")
     
-    def control_thread(self, left_gripper_value_in, right_gripper_value_in, left_gripper_state_value, right_gripper_state_value, dual_hand_data_lock = None, 
-                             dual_gripper_state_out = None, dual_gripper_action_out = None, xr_motion_data_ready_in = None,
-                             left_gripper_squeeze_in = None, right_gripper_squeeze_in = None, output_enabled_in = None):
+    def control_thread(self, dual_hand_data_lock=None, dual_gripper_state_out=None,
+                       dual_gripper_action_out=None, output_enabled_in=None):
         self.running = True
-        DELTA_GRIPPER_CMD = 0.18     # The motor rotates 5.4 radians, the clamping jaw slide open 9 cm, so 0.6 rad <==> 1 cm, 0.18 rad <==> 3 mm
-        THUMB_INDEX_DISTANCE_MIN = 5.0
-        THUMB_INDEX_DISTANCE_MAX = 7.0
-        LEFT_MAPPED_MIN  = 0.0           # The minimum initial motor position when the gripper closes at startup.
-        RIGHT_MAPPED_MIN = 0.0           # The minimum initial motor position when the gripper closes at startup.
-        # The maximum initial motor position when the gripper closes before calibration (with the rail stroke calculated as 0.6 cm/rad * 9 rad = 5.4 cm).
-        LEFT_MAPPED_MAX = LEFT_MAPPED_MIN + 5.40 
-        RIGHT_MAPPED_MAX = RIGHT_MAPPED_MIN + 5.40
-        if self.dual_trigger_mode:
-            left_target_action  = left_gripper_state_value.value
-            right_target_action = right_gripper_state_value.value
-        else:
-            left_target_action  = (LEFT_MAPPED_MAX - LEFT_MAPPED_MIN) / 2.0
-            right_target_action = (RIGHT_MAPPED_MAX - RIGHT_MAPPED_MIN) / 2.0
+        target = np.array([self.left_gripper_state_value.value, self.right_gripper_state_value.value])
 
         dq = 0.0
         tau = 0.0
@@ -386,27 +352,11 @@ class Dex1_1_Gripper_Controller:
         try:
             while self.running:
                 start_time = time.time()
-                # get dual hand skeletal point state from XR device
-                with left_gripper_value_in.get_lock():
-                    left_gripper_value  = left_gripper_value_in.value
-                with right_gripper_value_in.get_lock():
-                    right_gripper_value = right_gripper_value_in.value
-                if self.dual_trigger_mode:
-                    with left_gripper_squeeze_in.get_lock():
-                        left_squeeze_value = left_gripper_squeeze_in.value
-                    with right_gripper_squeeze_in.get_lock():
-                        right_squeeze_value = right_gripper_squeeze_in.value
-                if xr_motion_data_ready_in is not None:
-                    with xr_motion_data_ready_in.get_lock():
-                        xr_motion_data_ready = xr_motion_data_ready_in.value
-                else:
-                    xr_motion_data_ready = True
-                # get current dual gripper motor state
-                dual_gripper_state = np.array([left_gripper_state_value.value, right_gripper_state_value.value])
+                dual_gripper_state = np.array([self.left_gripper_state_value.value,
+                                               self.right_gripper_state_value.value])
 
                 if not shared_flag_is_set(output_enabled_in):
-                    left_target_action = dual_gripper_state[0]
-                    right_target_action = dual_gripper_state[1]
+                    target = dual_gripper_state
                     if dual_gripper_state_out is not None and dual_gripper_action_out is not None:
                         if dual_hand_data_lock is not None:
                             with dual_hand_data_lock:
@@ -418,33 +368,12 @@ class Dex1_1_Gripper_Controller:
                     time.sleep(1 / self.fps)
                     continue
 
-                if xr_motion_data_ready and self.dual_trigger_mode:
-                    # trigger value range: [10.0, 0.0], 10.0 means no press, 0.0 means full press
-                    # squeeze value range: [0.0, 1.0],  0.0 means no press, 1.0 means full press
-                    # pressing both or neither keeps the last command, so the gripper holds its grip force
-                    if left_gripper_value < 5.0 and left_squeeze_value < 0.5:        # only left trigger is pressed, gradually close
-                        left_target_action  = np.clip(dual_gripper_state[0] - DELTA_GRIPPER_CMD, LEFT_MAPPED_MIN, LEFT_MAPPED_MAX)
-                    elif left_gripper_value >= 5.0 and left_squeeze_value >= 0.5:    # only left squeeze is pressed, gradually open
-                        left_target_action  = np.clip(dual_gripper_state[0] + DELTA_GRIPPER_CMD, LEFT_MAPPED_MIN, LEFT_MAPPED_MAX)
-                    if right_gripper_value < 5.0 and right_squeeze_value < 0.5:      # only right trigger is pressed, gradually close
-                        right_target_action = np.clip(dual_gripper_state[1] - DELTA_GRIPPER_CMD, RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX)
-                    elif right_gripper_value >= 5.0 and right_squeeze_value >= 0.5:  # only right squeeze is pressed, gradually open
-                        right_target_action = np.clip(dual_gripper_state[1] + DELTA_GRIPPER_CMD, RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX)
-                elif xr_motion_data_ready:
-                    # Linear mapping from [0, THUMB_INDEX_DISTANCE_MAX] to gripper action range
-                    left_target_action  = np.interp(left_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [LEFT_MAPPED_MIN, LEFT_MAPPED_MAX])
-                    right_target_action = np.interp(right_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX])
-                else:
-                    left_target_action = dual_gripper_state[0]
-                    right_target_action = dual_gripper_state[1]
-                # clip dual gripper action to avoid overflow
+                target = (self.gripper_target(dual_gripper_state, target)
+                          if self.gripper_target is not None else dual_gripper_state)
+                step = self.GRIPPER_STEP_RAD
+                dual_gripper_action = target
                 if not self.simulation_mode:
-                    left_actual_action  = np.clip(left_target_action,  dual_gripper_state[0] - DELTA_GRIPPER_CMD, dual_gripper_state[0] + DELTA_GRIPPER_CMD) 
-                    right_actual_action = np.clip(right_target_action, dual_gripper_state[1] - DELTA_GRIPPER_CMD, dual_gripper_state[1] + DELTA_GRIPPER_CMD)
-                else:
-                    left_actual_action  = left_target_action
-                    right_actual_action = right_target_action
-                dual_gripper_action = np.array([left_actual_action, right_actual_action])
+                    dual_gripper_action = np.clip(target, dual_gripper_state - step, dual_gripper_state + step)
 
                 if self.smooth_filter:
                     self.smooth_filter.add_data(dual_gripper_action)
@@ -452,8 +381,8 @@ class Dex1_1_Gripper_Controller:
 
                 if dual_gripper_state_out and dual_gripper_action_out:
                     with dual_hand_data_lock:
-                        dual_gripper_state_out[:] = dual_gripper_state - np.array([LEFT_MAPPED_MIN, RIGHT_MAPPED_MIN])
-                        dual_gripper_action_out[:] = dual_gripper_action - np.array([LEFT_MAPPED_MIN, RIGHT_MAPPED_MIN])
+                        dual_gripper_state_out[:] = dual_gripper_state
+                        dual_gripper_action_out[:] = dual_gripper_action
 
                 self.ctrl_dual_gripper(dual_gripper_action)
                 current_time = time.time()

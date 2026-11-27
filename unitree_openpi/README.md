@@ -65,6 +65,8 @@ python unitree_openpi/scripts/test_g1d_client.py --url ws://192.168.66.200:8000 
 
 The joint client requires G1-D absolute joint metadata. State and each action use [left arm 7, raw left gripper, right arm 7, raw right gripper]. Both clients execute cloud targets only with --execute on hardware. The EEF formats below describe the legacy adapter.
 
+G1-D 入口默认每个 chunk 最多执行 20 条动作（`--max-execute 20`）。启用 `--rtc` 时，可执行窗口还剩 10 条动作就发出下一个请求（`--rtc-prefix-len 10`）。模型返回的长度小于上限时，按实际返回长度计算。
+
 1. **云端 → 机器人**：连接后先发 metadata 字典，允许空字典 `{}`。
 2. **机器人 → 云端**：发送一条 observation，默认字段如下。
 3. **云端 → 机器人**：返回一条带 `actions` 的字典。执行结果随下一条 observation 的 `_unitree.last_action` 返回。
@@ -83,7 +85,7 @@ The joint client requires G1-D absolute joint metadata. State and each action us
 | `{"actions":{"joint_positions": q}}` | `q[H,14]`，绝对关节角（rad），左 7 后右 7，每臂依次为肩 pitch/roll/yaw、肘、腕 roll/pitch/yaw |
 | `{"actions":{"joint_positions": q,"eef": eef}}` | 两者步数相同。逐步用 FK 检查两种目标一致后执行关节目标 |
 
-单步也接受一维数组。默认 `1 ≤ H ≤ 64`，每轮只执行第一步，再采集新观测。回复可带顶层 `observation_id`，其值须等于本次 `_unitree.sequence`。默认观测有效期 2 秒。
+旧版 EEF 适配器也接受表示单步动作的一维数组。其默认 `1 ≤ H ≤ 64`，每轮执行第一步后采集新观测。回复可带顶层 `observation_id`，其值须等于本次 `_unitree.sequence`。默认观测有效期 2 秒。
 
 夹爪通道索引为 6、13（从零计数）。默认内置 Dex1 电机映射为闭合 0、打开 2.3 rad，可用 `closed_q2` / `open_q2` 按实机标定修改。可选 `protocol=json` 使用文本帧、数字列表和 JPEG 图像对象（`encoding="jpeg_base64"`、`color_space="RGB"`、`shape`、`data`）。
 

@@ -14,7 +14,8 @@ from unitree_openpi.scripts._motion import motion_parser, motion_session
 from unitree_openpi.robot_ctrl.kinematics import ARM_JOINT_NAMES
 
 
-from unitree_openpi.robot_ctrl.postures import HANGING
+HANGING = np.array([.0948, -.0242, .1446, 1.3979, -.2679, -.0964, -.1156,
+                    .0739, .0234, .0317, 1.3795, -.2829, .0129, -.0980])
 
 
 MOVE_SECONDS = 4.0

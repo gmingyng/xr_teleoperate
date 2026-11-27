@@ -13,10 +13,8 @@ import numpy as np
 
 
 class V3Writer:
-    def __init__(self, task_dir, task_goal, frequency, extra_info, barcode_scanner=False,
-                 scan_beep=False, **unused):
-        from .recording_schema import BarcodeReceiver
-        from .episode_writer import beep_scan
+    def __init__(self, task_dir, task_goal, frequency, extra_info, *, scanner=None, **unused):
+        self.scanner = scanner
         self.goal = task_goal
         self.mapping = extra_info["camera_mapping"]
         if set(self.mapping.values()) != {"cam_left_high","cam_right_high","cam_left_wrist","cam_right_wrist"}:
@@ -36,8 +34,6 @@ class V3Writer:
         try:
             if self.proc.stdout.readline() != b"READY\n":
                 raise RuntimeError("LeRobot writer failed to initialize; see stderr")
-            notify = (lambda: Thread(target=beep_scan,daemon=True).start()) if scan_beep else None
-            self.scanner = BarcodeReceiver(on_scan=notify) if barcode_scanner else None
         except BaseException:
             self.proc.stdin.close()
             self.proc.wait()
@@ -132,8 +128,6 @@ class V3Writer:
             if self.proc.wait() or self.failed:
                 raise RuntimeError("v3 writer failed; inspect stderr") from self.failed
         finally:
-            if self.scanner:
-                self.scanner.close()
             self.lock.close()
 
 
