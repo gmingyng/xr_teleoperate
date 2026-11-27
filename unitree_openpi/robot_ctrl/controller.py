@@ -11,6 +11,10 @@ class JointStepLimitError(ValueError):
     """A target exceeds the permitted change from measured arm positions."""
 
 
+class ActionReplanRequired(RuntimeError):
+    """The feedback used to calculate a target changed before dispatch."""
+
+
 class EEFController:
     def __init__(self, config, backend, kinematics, execute=False, *, control_waist=True):
         self.config, self.backend, self.kin = config, backend, kinematics
@@ -73,24 +77,25 @@ class EEFController:
                 raise ValueError(f"{side} target exceeds configured EEF workspace")
         if q is None:
             q = self.kin.solve(targets, state["q14"])
-        joint_step = np.abs(q - state["q14"])
+        tau = self.kin.gravity(q)
+        if time.monotonic() >= expires_at:
+            raise TimeoutError("action expired while validating the target")
+        latest = self.backend.read()
+        # Relative targets depend on the initial arm pose. Absolute targets do not.
+        if (action is not None and
+                np.max(np.abs(latest["q14"] - state["q14"])) > motion["arrival_tolerance_rad"]):
+            raise ActionReplanRequired("robot moved during IK; target must be replanned")
+        if np.max(np.abs(latest["waist_q3"] - state["waist_q3"])) > motion["waist_tolerance_rad"]:
+            raise ActionReplanRequired("waist moved during target validation; target must be replanned")
+        joint_step = np.abs(q - latest["q14"])
         largest_step = float(np.max(joint_step))
         if largest_step > motion["max_joint_step_rad"]:
             joint = int(np.argmax(joint_step))
             raise JointStepLimitError(
                 f"joint step {largest_step:.3f} rad exceeds max_joint_step_rad "
                 f"{motion['max_joint_step_rad']:g} at arm joint index {joint} "
-                f"(measured {state['q14'][joint]:.3f}, target {q[joint]:.3f})"
+                f"(measured {latest['q14'][joint]:.3f}, target {q[joint]:.3f})"
             )
-        tau = self.kin.gravity(q)
-        if time.monotonic() >= expires_at:
-            raise TimeoutError("action expired while computing IK")
-        # Recheck feedback after a potentially slow numerical solve.
-        latest = self.backend.read()
-        if np.max(np.abs(latest["q14"] - state["q14"])) > motion["arrival_tolerance_rad"]:
-            raise RuntimeError("robot moved during IK; target must be replanned")
-        if np.max(np.abs(latest["waist_q3"] - state["waist_q3"])) > motion["waist_tolerance_rad"]:
-            raise RuntimeError("waist moved during IK; target must be replanned")
         grip = None
         if gripper_positions is not None:
             grip = vector(gripper_positions, 2, "absolute gripper positions")

@@ -14,7 +14,7 @@ from websockets.sync.server import serve
 from unitree_openpi.scripts._inference import execute_policy, observation, run
 from unitree_openpi.mock_policy_server import make_handler
 from unitree_openpi.policy_protocol import parse_actions, parse_joint_actions
-from unitree_openpi.robot_ctrl.controller import EEFController
+from unitree_openpi.robot_ctrl.controller import ActionReplanRequired, EEFController
 from unitree_openpi.robot_ctrl.dds import G1DDSBackend
 from unitree_openpi.robot_ctrl.mock import MockBackend, MockKinematics
 from unitree_openpi.utils.cameras import CameraCapture, MockCameras, prepare_rgb
@@ -96,6 +96,53 @@ class RelativeActions(unittest.TestCase):
         try:
             with self.assertRaises(TimeoutError):
                 apply_joint(ctrl, np.zeros(16), time.monotonic() + .01)
+            self.assertFalse(backend.commands)
+        finally:
+            ctrl.close()
+
+    def test_absolute_joint_step_uses_latest_arm_feedback(self):
+        for latest_q, accepted in ((.10, True), (-.10, False)):
+            with self.subTest(latest_q=latest_q):
+                settings = config()
+                settings["motion"]["max_joint_step_rad"] = .2
+                backend = MockBackend(settings)
+                kin = MockKinematics()
+                ctrl = EEFController(settings, backend, kin, execute=True)
+                ctrl.connect()
+
+                def gravity(q):
+                    backend.q[3] = latest_q
+                    return np.zeros(14)
+
+                kin.gravity = gravity
+                row = np.zeros(16)
+                row[3] = .25 if accepted else .15
+                try:
+                    if accepted:
+                        apply_joint(ctrl, row, time.monotonic() + 2)
+                        self.assertAlmostEqual(backend.commands[0][3], row[3])
+                    else:
+                        with self.assertRaisesRegex(ValueError, "joint step"):
+                            apply_joint(ctrl, row, time.monotonic() + 2)
+                        self.assertFalse(backend.commands)
+                finally:
+                    ctrl.close()
+
+    def test_relative_target_still_rejects_arm_feedback_drift(self):
+        settings = config()
+        backend = MockBackend(settings)
+        kin = MockKinematics()
+        ctrl = EEFController(settings, backend, kin, execute=True)
+        ctrl.connect()
+
+        def gravity(q):
+            backend.q[3] = .10
+            return np.zeros(14)
+
+        kin.gravity = gravity
+        try:
+            with self.assertRaisesRegex(ActionReplanRequired, "robot moved during IK"):
+                ctrl.apply(np.zeros(14), time.monotonic() + 2)
             self.assertFalse(backend.commands)
         finally:
             ctrl.close()
@@ -447,6 +494,68 @@ class EndToEnd(unittest.TestCase):
         np.testing.assert_allclose(wrist[:2], [.01, .03])
         self.assertTrue(np.any(np.isclose(wrist[2:], .02)))
         self.assertTrue(np.all(np.isclose(wrist[2:], .02) | np.isclose(wrist[2:], .04)))
+
+    def test_rtc_holds_and_reconnects_after_camera_failure_and_bad_reply(self):
+        settings = config()
+        settings["policy"].update(rtc=True, target_hz=10, execute_steps=4,
+                                  rtc_prefix_len=3, reconnect_s=.01)
+        connections = []
+        requests = []
+        stop = threading.Event()
+
+        class Cameras(MockCameras):
+            def snapshot(self):
+                if self.sequence == 0:
+                    self.sequence += 1
+                    raise RuntimeError("missing or stale cameras")
+                return super().snapshot()
+
+        class Backend(MockBackend):
+            freezes = 0
+
+            def freeze(self):
+                self.freezes += 1
+
+            def command(self, q, tau, grip_q2=None):
+                super().command(q, tau, grip_q2)
+                stop.set()
+
+        def policy(connection):
+            connections.append(connection)
+            metadata = dict(self.JOINT_METADATA["g1d"], rtc=True, action_horizon=4)
+            connection.send(packb({"g1d": metadata}))
+            for payload in connection:
+                obs = unpackb(payload)
+                requests.append(obs)
+                if len(requests) == 1:
+                    connection.send(packb({"actions": np.zeros((1, 16))}))
+                else:
+                    rows = np.zeros((4, 16))
+                    rows[:, 3] = .02
+                    connection.send(packb({"actions": rows}))
+
+        backend = Backend(settings)
+        ctrl = EEFController(settings, backend, MockKinematics(), execute=True)
+        with serve(policy, "127.0.0.1", 0) as server:
+            settings["policy"]["url"] = f"ws://127.0.0.1:{server.socket.getsockname()[1]}"
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            timer = threading.Timer(4, stop.set)
+            timer.start()
+            try:
+                run(settings, ctrl, Cameras(settings["cameras"]), stop=stop)
+            finally:
+                timer.cancel()
+                server.shutdown()
+                thread.join(timeout=2)
+
+        self.assertEqual(len(connections), 3)
+        self.assertEqual(len(requests), 2)
+        self.assertNotIn("rtc_prefix", requests[1])
+        self.assertIn("Invalid RTC policy response", requests[1]["_unitree"]["last_action"]["message"])
+        self.assertGreaterEqual(backend.freezes, 2)
+        self.assertEqual(len(backend.commands), 1)
+        self.assertAlmostEqual(backend.commands[0][3], .02)
 
     def test_late_policy_reply_never_reaches_robot(self):
         settings = config()

@@ -42,6 +42,10 @@ class CameraCapture:
     def start(self):
         if self._thread is not None:
             raise RuntimeError("camera capture already started")
+        self._stop.clear()
+        with self._lock:
+            self._frames.clear()
+            self._errors.clear()
         self._thread = threading.Thread(target=self._run, name="g1d-cameras", daemon=True)
         self._thread.start()
         deadline = time.monotonic() + self.settings["startup_timeout_s"]
@@ -124,6 +128,8 @@ class CameraCapture:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2)
+            if not self._thread.is_alive():
+                self._thread = None
 
 
 class MockCameras:

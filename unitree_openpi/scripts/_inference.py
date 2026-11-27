@@ -6,7 +6,7 @@ import threading
 import time
 
 from ..policy_protocol import parse_joint_actions, parse_policy_chunk, state_vector
-from ..robot_ctrl.controller import JointStepLimitError
+from ..robot_ctrl.controller import ActionReplanRequired, JointStepLimitError
 from ..utils.websocket import PolicyClient
 
 log = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ def execute_policy(controller, response, sequence, expires, stop, *, recorder=No
             try:
                 status = controller.apply(None, deadline, joint_positions=np.r_[row[:7], row[8:15]],
                                           gripper_positions=row[[7, 15]], wait_for_arrival=False)
-            except JointStepLimitError as exc:
+            except (ActionReplanRequired, JointStepLimitError) as exc:
                 if settings.get("rtc"):
                     raise
                 controller.freeze()
@@ -182,7 +182,7 @@ def rtc_loop(config, controller, cameras, client, prompt, max_steps, stop, handl
                     obs["rtc_prefix"] = prefix
                     obs["rtc_delay"] = min(delay, len(prefix))
                 requested_flag = flag
-                pending = worker.submit(client.infer, obs, timeout_s=None)
+                pending = worker.submit(client.infer, obs)
 
             if plan is None:
                 stop.wait(min(period, 0.005))
@@ -192,7 +192,7 @@ def rtc_loop(config, controller, cameras, client, prompt, max_steps, stop, handl
                     try:
                         status = handle_response(controller, {"actions": plan[row:row+1]}, plan_sequence,
                                                  expires, stop)
-                    except JointStepLimitError as exc:
+                    except (ActionReplanRequired, JointStepLimitError) as exc:
                         controller.freeze()
                         # Keep trying later rows, but do not guide with this plan again.
                         prefix_valid = False
@@ -216,9 +216,45 @@ def rtc_loop(config, controller, cameras, client, prompt, max_steps, stop, handl
             worker.shutdown(wait=True, cancel_futures=True)
 
 
+def _latched_stop(controller):
+    health = controller.backend.health()
+    return health.get("fault") or health.get("stopped")
+
+
+def _hold_after_failure(config, controller, client, stop, exc):
+    controller.freeze()
+    try:
+        client.close()
+    except Exception as close_error:
+        log.warning("Policy connection cleanup failed: %s", close_error)
+    fault = _latched_stop(controller)
+    if fault:
+        log.error("DDS stop is latched (%s); holding last published targets until stopped: %s", fault, exc)
+        stop.wait()
+    else:
+        log.warning("Holding; retrying from fresh feedback after %s: %s", type(exc).__name__, exc)
+        stop.wait(config["policy"].get("reconnect_s", 1.0))
+
+
+def _retry_holding(operation, config, controller, client, stop, max_steps, feedback):
+    while not stop.is_set():
+        try:
+            return operation()
+        except Exception as exc:
+            if max_steps:
+                raise
+            feedback["last_action"] = {"status": "error", "message": str(exc)}
+            _hold_after_failure(config, controller, client, stop, exc)
+    return 0
+
+
 def _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, handle_response, scanner, feedback):
     if config["policy"].get("rtc"):
-        return rtc_loop(config, controller, cameras, client, prompt, max_steps, stop, handle_response, scanner, feedback)
+        return _retry_holding(
+            lambda: rtc_loop(config, controller, cameras, client, prompt, max_steps, stop,
+                             handle_response, scanner, feedback),
+            config, controller, client, stop, max_steps, feedback,
+        )
     sequence, completed = 0, 0
     while not stop.is_set() and (not max_steps or completed < max_steps):
         started = time.monotonic()
@@ -273,11 +309,9 @@ def _infer_loop(config, controller, cameras, client, prompt, max_steps, stop, ha
             controller.freeze()
             feedback["last_action"] = {"status": "error", "observation_id": sequence,
                                       "message": str(exc)}
-            log.warning("Holding; inference/action failed: %s", exc)
-            client.close()  # Discard delayed replies; reconnect with a new observation.
             if max_steps:
                 raise
-            stop.wait(config["policy"].get("reconnect_s", 1.0))
+            _hold_after_failure(config, controller, client, stop, exc)
         period = 1.0 / config["motion"]["command_hz"]
         stop.wait(max(0, period - (time.monotonic() - started)))
     return completed
@@ -316,8 +350,8 @@ def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, handl
     try:
         controller.connect()
         if not reset_first:
-            cameras.start()
-            return session()
+            _retry_holding(cameras.start, config, controller, client, stop, max_steps, feedback)
+            return _retry_holding(session, config, controller, client, stop, max_steps, feedback)
 
         from ..robot_ctrl.joint_motion import joint_limits
         from .reset_dual_arms import move_to_reset
@@ -325,18 +359,34 @@ def run(config, controller, cameras, *, prompt="", max_steps=0, stop=None, handl
         limits = joint_limits(config)
         cameras_started = False
         while not stop.is_set():
-            move_to_reset(controller.backend, controller.kin, config, 5.0, limits)
+            try:
+                move_to_reset(controller.backend, controller.kin, config, 5.0, limits)
+            except (OSError, RuntimeError, ValueError) as exc:
+                if max_steps:
+                    raise
+                _hold_after_failure(config, controller, client, stop, exc)
+                if stop.is_set():
+                    break
+                try:
+                    input("Holding after a failed reset. Enter retries reset; Ctrl+C exits. ")
+                except EOFError:
+                    break
+                continue
             try:
                 input("Holding reset. Enter starts inference; Ctrl+C exits. ")
             except EOFError:
                 break
             if not cameras_started:
-                cameras.start()
+                _retry_holding(cameras.start, config, controller, client, stop, max_steps, feedback)
+                if stop.is_set():
+                    break
                 cameras_started = True
             try:
                 log.info("Inference active. Ctrl+C cancels the chunk and returns arms to reset.")
-                completed += session()
+                completed += _retry_holding(session, config, controller, client, stop, max_steps, feedback)
             except KeyboardInterrupt:
+                if _latched_stop(controller):
+                    raise
                 log.info("Inference cancelled; returning to reset.")
             controller.freeze()
             client.close()
