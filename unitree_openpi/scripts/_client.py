@@ -31,7 +31,7 @@ def launch(argv=None, *, prompt="", control_waist=True, interactive=False):
                         help="save one review MP4 per inference session (default directory: recordings)")
     parser.add_argument("--barcode-scanner", action="store_true", help="send a latched scan flag to a 17-D joint policy")
     parser.add_argument("--rtc", action="store_true", help="replan asynchronously with an RTC policy")
-    parser.add_argument("--rtc-prefix-len", type=int, default=10,
+    parser.add_argument("--rtc-prefix-len", type=int, default=8,
                         help="send the next RTC request when this many executable actions remain (default: %(default)s)")
     args = parser.parse_args(argv)
     if args.rtc_prefix_len < 1:
