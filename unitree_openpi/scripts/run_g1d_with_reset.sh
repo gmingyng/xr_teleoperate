@@ -14,8 +14,8 @@ case ${1:-} in
 esac
 args=(
     --url ws://192.168.66.200:8000
-    --prompt "Pick the blue bottle from the shelf and place it at the fixed target."
-    --hz 50
+    --barcode-scanner
+    --rtc
     "$@"
 )
 for arg in "$@"; do

@@ -392,9 +392,10 @@ class G1DDSBackend:
                 self._grip_target = self._last_sent_grip.copy()
 
     def _check_tracking_locked(self, state, now):
-        checks = {
-            "gripper": (state["grip_q2"], self._last_sent_grip, self.motion["grip_tolerance"]),
-        }
+        grip_tol = self.motion.get("gripper_tracking_tolerance", self.motion["grip_tolerance"])
+        checks = {}
+        if grip_tol is not None:
+            checks["gripper"] = (state["grip_q2"], self._last_sent_grip, grip_tol)
         if self._last_sent_q is not None and not self._arm_zero_torque:
             tol = self.motion.get("arm_tracking_tolerance_rad", self.motion["tracking_tolerance_rad"])
             checks["arm"] = (state["q14"], self._last_sent_q, tol)

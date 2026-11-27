@@ -7,6 +7,10 @@ import numpy as np
 from ..utils.transforms import relative_target, vector
 
 
+class JointStepLimitError(ValueError):
+    """A target exceeds the permitted change from measured arm positions."""
+
+
 class EEFController:
     def __init__(self, config, backend, kinematics, execute=False, *, control_waist=True):
         self.config, self.backend, self.kin = config, backend, kinematics
@@ -69,8 +73,15 @@ class EEFController:
                 raise ValueError(f"{side} target exceeds configured EEF workspace")
         if q is None:
             q = self.kin.solve(targets, state["q14"])
-        if np.max(np.abs(q - state["q14"])) > motion["max_joint_step_rad"]:
-            raise ValueError("IK joint step exceeds max_joint_step_rad")
+        joint_step = np.abs(q - state["q14"])
+        largest_step = float(np.max(joint_step))
+        if largest_step > motion["max_joint_step_rad"]:
+            joint = int(np.argmax(joint_step))
+            raise JointStepLimitError(
+                f"joint step {largest_step:.3f} rad exceeds max_joint_step_rad "
+                f"{motion['max_joint_step_rad']:g} at arm joint index {joint} "
+                f"(measured {state['q14'][joint]:.3f}, target {q[joint]:.3f})"
+            )
         tau = self.kin.gravity(q)
         if time.monotonic() >= expires_at:
             raise TimeoutError("action expired while computing IK")

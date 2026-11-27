@@ -55,6 +55,9 @@ def launch(argv=None, *, prompt="", control_waist=True, interactive=False):
         parser.error("--hz must be positive and cannot exceed the DDS publish rate")
     config["policy"]["target_hz"] = args.hz
     config["policy"]["action_space"] = "joint"
+    # Contact can keep the fingers from reaching the requested position.
+    config["motion"]["gripper_tracking_tolerance"] = None
+    config["motion"]["gripper_speed"] = 8.0
     if not args.execute:
         config["policy"]["timeout_s"] = max(config["policy"]["timeout_s"], 120)
     if args.url:

@@ -6,6 +6,7 @@ import threading
 import time
 
 from ..policy_protocol import parse_joint_actions, parse_policy_chunk, state_vector
+from ..robot_ctrl.controller import JointStepLimitError
 from ..utils.websocket import PolicyClient
 
 log = logging.getLogger(__name__)
@@ -48,8 +49,7 @@ def execute_policy(controller, response, sequence, expires, stop, *, recorder=No
     last_action = None
     if settings.get("action_space") == "joint":
         actions = parse_joint_actions(response, max_steps=settings["max_chunk_steps"]).copy()
-        grippers = actions[:, [7, 15]]
-        actions[:, [7, 15]] = np.where(grippers <= 5.0, 2.2, grippers)
+        actions[:, [7, 15]] -= 0.5
         if not controller.execute:
             if recorder is not None:
                 recorder.target = actions[0].copy()
@@ -62,11 +62,19 @@ def execute_policy(controller, response, sequence, expires, stop, *, recorder=No
                 break
             started = time.monotonic()
             deadline = min(expires, started + config["motion"]["action_timeout_s"])
-            status = controller.apply(None, deadline, joint_positions=np.r_[row[:7], row[8:15]],
-                                      gripper_positions=row[[7, 15]], wait_for_arrival=False)
-            if recorder is not None:
-                recorder.target = row.copy()
-            last_action = dict(status, observation_id=sequence, step=i)
+            try:
+                status = controller.apply(None, deadline, joint_positions=np.r_[row[:7], row[8:15]],
+                                          gripper_positions=row[[7, 15]], wait_for_arrival=False)
+            except JointStepLimitError as exc:
+                if settings.get("rtc"):
+                    raise
+                controller.freeze()
+                last_action = {"status": "error", "observation_id": sequence, "step": i, "message": str(exc)}
+                log.warning("Skipped observation %d row %d: %s", sequence, i, exc)
+            else:
+                if recorder is not None:
+                    recorder.target = row.copy()
+                last_action = dict(status, observation_id=sequence, step=i)
             if i + 1 < len(chunk):
                 stop.wait(max(0.0, min(started + period, expires) - time.monotonic()))
         return last_action
@@ -95,6 +103,8 @@ def rtc_loop(config, controller, cameras, client, prompt, max_steps, stop, handl
     period = 1 / settings["target_hz"]
     sequence = completed = 0
     plan = pending = None
+    discard_reply = False
+    prefix_valid = False
     delay = 1
     worker = ThreadPoolExecutor(max_workers=1)
     try:
@@ -121,10 +131,13 @@ def rtc_loop(config, controller, cameras, client, prompt, max_steps, stop, handl
             if pending is not None and pending.done():
                 reply = pending.result()
                 pending = None
+                if discard_reply:
+                    discard_reply = False
+                    continue
                 actions = parse_joint_actions(reply, max_steps=horizon, dtype=np.float32)
                 if len(actions) != horizon or reply.get("observation_id", sequence) != sequence:
                     raise ValueError("Invalid RTC policy response")
-                offset = max(row - prefix_start, int((now - requested) / period)) if guided else 0
+                offset = max(row - overlap_start, int((now - requested) / period)) if overlapping else 0
                 delay = max(1, math.ceil((now - requested) / period))
                 if now >= deadline:
                     controller.freeze()
@@ -133,7 +146,8 @@ def rtc_loop(config, controller, cameras, client, prompt, max_steps, stop, handl
                     continue
                 if flag == requested_flag and offset < chunk_len:
                     plan, row, plan_flag, expires = actions[:chunk_len], offset, flag, deadline
-                    origin = requested if guided else now
+                    origin = requested if overlapping else now
+                    prefix_valid = True
                     plan_sequence = sequence
                     completed += 1
 
@@ -159,9 +173,11 @@ def rtc_loop(config, controller, cameras, client, prompt, max_steps, stop, handl
                 deadline = observed + settings["max_observation_age_s"]
                 if plan is not None:
                     row = max(row, int((requested - origin) / period))
-                guided = plan is not None and row < chunk_len
+                overlapping = plan is not None and row < chunk_len
+                if overlapping:
+                    overlap_start = row
+                guided = overlapping and prefix_valid
                 if guided:
-                    prefix_start = row
                     prefix = plan[row:].copy()
                     obs["rtc_prefix"] = prefix
                     obs["rtc_delay"] = min(delay, len(prefix))
@@ -173,10 +189,22 @@ def rtc_loop(config, controller, cameras, client, prompt, max_steps, stop, handl
                 continue
             if row < chunk_len and time.monotonic() < expires:
                 if not scanner or bool(scanner.frame(time.monotonic_ns())["scan_success"]) == plan_flag:
-                    status = handle_response(controller, {"actions": plan[row:row+1]}, plan_sequence,
-                                             expires, stop)
-                    if status is not None:
-                        feedback["last_action"] = status
+                    try:
+                        status = handle_response(controller, {"actions": plan[row:row+1]}, plan_sequence,
+                                                 expires, stop)
+                    except JointStepLimitError as exc:
+                        controller.freeze()
+                        # Keep trying later rows, but do not guide with this plan again.
+                        prefix_valid = False
+                        if pending is not None and guided:
+                            discard_reply = True
+                        feedback["last_action"] = {"status": "error", "observation_id": plan_sequence,
+                                                   "step": row, "message": str(exc)}
+                        log.warning("RTC skipped observation %d row %d: %s",
+                                    plan_sequence, row, exc)
+                    else:
+                        if status is not None:
+                            feedback["last_action"] = status
             row += 1
             stop.wait(max(0, origin + row * period - time.monotonic()))
         return completed

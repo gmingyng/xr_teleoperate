@@ -11,7 +11,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 from websockets.sync.server import serve
 
-from unitree_openpi.scripts._inference import observation, run
+from unitree_openpi.scripts._inference import execute_policy, observation, run
 from unitree_openpi.mock_policy_server import make_handler
 from unitree_openpi.policy_protocol import parse_actions, parse_joint_actions
 from unitree_openpi.robot_ctrl.controller import EEFController
@@ -375,6 +375,78 @@ class EndToEnd(unittest.TestCase):
         self.assertAlmostEqual(backend.q[0], .003, places=7)
         self.assertEqual(received[1]["_unitree"]["last_action"]["status"], "target_sent")
         self.assertEqual(received[0]["observation/images/right_wrist"].shape, (224, 224, 3))
+
+    def test_joint_chunk_continues_after_oversize_row(self):
+        settings = config()
+        settings["policy"]["execute_steps"] = 3
+        settings["motion"]["max_joint_step_rad"] = 0.3
+        backend = MockBackend(settings)
+        ctrl = EEFController(settings, backend, MockKinematics(), execute=True)
+        rows = np.zeros((3, 16))
+        rows[:, 3] = [.01, .5, .03]
+        ctrl.connect()
+        try:
+            status = execute_policy(ctrl, {"actions": rows}, 1, time.monotonic() + 2, threading.Event())
+        finally:
+            ctrl.close()
+
+        self.assertEqual(status["step"], 2)
+        np.testing.assert_allclose(np.asarray(backend.commands)[:, 3], [.01, .03])
+
+    def test_rtc_skips_oversize_row_and_discards_its_in_flight_prefix(self):
+        settings = config()
+        settings["policy"].update(rtc=True, target_hz=10, execute_steps=4, rtc_prefix_len=3)
+        settings["motion"]["max_joint_step_rad"] = 0.3
+        requests = []
+        valid_tail_sent = threading.Event()
+        stop = threading.Event()
+
+        class Backend(MockBackend):
+            def command(self, q, tau, grip_q2=None):
+                super().command(q, tau, grip_q2)
+                if np.isclose(q[3], .03):
+                    valid_tail_sent.set()
+
+        def policy(connection):
+            metadata = dict(self.JOINT_METADATA["g1d"], rtc=True, action_horizon=4)
+            connection.send(packb({"g1d": metadata}))
+            for payload in connection:
+                obs = unpackb(payload)
+                requests.append(obs)
+                sequence = obs["_unitree"]["sequence"]
+                rows = np.zeros((4, 16), dtype=np.float32)
+                if sequence == 1:
+                    rows[:, 3] = [.01, .5, .03, .04]
+                elif sequence == 2:
+                    valid_tail_sent.wait(timeout=1)
+                    rows[:, 3] = .1
+                else:
+                    rows[:, 3] = .02
+                connection.send(packb({"actions": rows, "observation_id": sequence}))
+
+        backend = Backend(settings)
+        ctrl = EEFController(settings, backend, MockKinematics(), execute=True)
+        with serve(policy, "127.0.0.1", 0) as server:
+            settings["policy"]["url"] = f"ws://127.0.0.1:{server.socket.getsockname()[1]}"
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            timer = threading.Timer(4, stop.set)
+            timer.start()
+            try:
+                completed = run(settings, ctrl, MockCameras(settings["cameras"]), max_steps=2, stop=stop)
+            finally:
+                timer.cancel()
+                server.shutdown()
+                thread.join(timeout=2)
+
+        self.assertEqual(completed, 2)
+        self.assertEqual(len(requests), 3)
+        self.assertIn("rtc_prefix", requests[1])
+        self.assertNotIn("rtc_prefix", requests[2])
+        wrist = np.asarray(backend.commands)[:, 3]
+        np.testing.assert_allclose(wrist[:2], [.01, .03])
+        self.assertTrue(np.any(np.isclose(wrist[2:], .02)))
+        self.assertTrue(np.all(np.isclose(wrist[2:], .02) | np.isclose(wrist[2:], .04)))
 
     def test_late_policy_reply_never_reaches_robot(self):
         settings = config()
